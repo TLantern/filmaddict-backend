@@ -122,3 +122,35 @@ async def stop_learning_worker() -> None:
             pass
         logger.info("Learning worker stopped")
 
+
+# RQ (Redis Queue) setup for separate worker process
+try:
+    from rq import Queue
+    from redis import Redis
+    import redis
+    
+    # Get Redis URL from environment
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    
+    # Parse Redis URL and create connection
+    # Handle both redis:// and rediss:// (SSL) URLs
+    if redis_url.startswith("rediss://"):
+        # SSL connection
+        redis_conn = redis.from_url(
+            redis_url,
+            ssl_cert_reqs=None,
+            decode_responses=False
+        )
+    else:
+        # Non-SSL connection
+        redis_conn = redis.from_url(redis_url, decode_responses=False)
+    
+    # Create RQ queue for video processing
+    video_processing_queue = Queue("video_processing", connection=redis_conn)
+    
+except ImportError:
+    # RQ not available, set to None
+    redis_conn = None
+    video_processing_queue = None
+    logger.warning("RQ not available - worker.py will not work without rq and redis packages")
+
