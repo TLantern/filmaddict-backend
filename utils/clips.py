@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import shutil
 import tempfile
 import urllib.request
 import uuid
@@ -19,6 +20,17 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
 CLIPS_DIR = os.path.join(UPLOAD_DIR, "clips")
 THUMBNAILS_DIR = os.path.join(UPLOAD_DIR, "thumbnails")
 MAX_CONCURRENT_CLIPS = 3  # Parallel clip generation limit
+
+
+def _check_ffmpeg_available() -> None:
+    """Check if ffmpeg binary is available in PATH."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "ffmpeg binary not found. Please install ffmpeg: "
+            "Ubuntu/Debian: apt-get install ffmpeg, "
+            "macOS: brew install ffmpeg, "
+            "or see https://ffmpeg.org/download.html"
+        )
 
 
 def generate_clip(video_path: str, start: float, end: float) -> Tuple[str, Optional[str]]:
@@ -67,6 +79,8 @@ def generate_clip(video_path: str, start: float, end: float) -> Tuple[str, Optio
     temp_clip_path = temp_file.name
     temp_file.close()
     
+    _check_ffmpeg_available()
+    
     try:
         logger.info(f"Generating clip from {video_path} at {start:.2f}s to {end:.2f}s")
         
@@ -99,6 +113,22 @@ def generate_clip(video_path: str, start: float, end: float) -> Tuple[str, Optio
             logger.info(f"Successfully generated clip: {relative_path}")
             return (relative_path, None)
         
+    except FileNotFoundError as e:
+        if "ffmpeg" in str(e).lower():
+            error_msg = (
+                "ffmpeg binary not found. Please install ffmpeg: "
+                "Ubuntu/Debian: apt-get install ffmpeg, "
+                "macOS: brew install ffmpeg, "
+                "or see https://ffmpeg.org/download.html"
+            )
+            logger.error(error_msg)
+            if os.path.exists(temp_clip_path):
+                try:
+                    os.remove(temp_clip_path)
+                except:
+                    pass
+            raise RuntimeError(error_msg) from e
+        raise
     except ffmpeg.Error as e:
         error_message = e.stderr.decode() if e.stderr else str(e)
         logger.error(f"FFmpeg error generating clip: {error_message}")
@@ -182,6 +212,8 @@ def generate_thumbnail(clip_path: str, time_offset: float = 0.0) -> str:
     temp_thumbnail_path = temp_file.name
     temp_file.close()
     
+    _check_ffmpeg_available()
+    
     try:
         logger.info(f"Generating thumbnail from {actual_clip_path} at {time_offset:.2f}s")
         
@@ -210,6 +242,27 @@ def generate_thumbnail(clip_path: str, time_offset: float = 0.0) -> str:
         logger.info(f"Successfully generated thumbnail: {relative_path}")
         return relative_path
         
+    except FileNotFoundError as e:
+        if "ffmpeg" in str(e).lower():
+            error_msg = (
+                "ffmpeg binary not found. Please install ffmpeg: "
+                "Ubuntu/Debian: apt-get install ffmpeg, "
+                "macOS: brew install ffmpeg, "
+                "or see https://ffmpeg.org/download.html"
+            )
+            logger.error(error_msg)
+            if os.path.exists(temp_thumbnail_path):
+                try:
+                    os.remove(temp_thumbnail_path)
+                except:
+                    pass
+            if temp_clip_path and os.path.exists(temp_clip_path):
+                try:
+                    os.remove(temp_clip_path)
+                except:
+                    pass
+            raise RuntimeError(error_msg) from e
+        raise
     except ffmpeg.Error as e:
         error_message = e.stderr.decode() if e.stderr else str(e)
         logger.error(f"FFmpeg error generating thumbnail: {error_message}")
