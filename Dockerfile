@@ -21,5 +21,6 @@ COPY . .
 EXPOSE 8000
 
 # Default command (can be overridden)
+# PORT env var is already handled in main.py
 CMD ["python", "main.py"]
 
