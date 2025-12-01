@@ -24,6 +24,7 @@ dependencies = [
     "boto3>=1.34.0",
     "rq>=1.15.0",
     "redis>=5.0.0",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
