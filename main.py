@@ -149,6 +149,10 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "YKlipp Backend API"}
+
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
