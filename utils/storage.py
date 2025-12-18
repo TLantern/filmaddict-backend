@@ -291,20 +291,20 @@ class S3Storage(StorageInterface):
             logger.error(f"Error downloading {relative_path} from S3: {str(e)}")
             raise Exception(f"Failed to download video from S3: {str(e)}")
 
-    def store_clip_from_file(self, file_path: str, filename: str) -> str:
+    def store_moment_from_file(self, file_path: str, filename: str) -> str:
         """
-        Stream upload clip file from local path directly to S3.
+        Stream upload moment file from local path directly to S3.
         
         Args:
-            file_path: Path to local clip file to upload
+            file_path: Path to local moment file to upload
             filename: Original filename (for extension detection)
             
         Returns:
-            Relative storage path (e.g., "clips/uuid.mp4")
+            Relative storage path (e.g., "moments/uuid.mp4")
         """
         file_extension = Path(filename).suffix if filename else ".mp4"
         unique_filename = f"{uuid.uuid4()}{file_extension}"
-        s3_key = f"clips/{unique_filename}"
+        s3_key = f"moments/{unique_filename}"
         
         try:
             with open(file_path, "rb") as f:
@@ -314,14 +314,14 @@ class S3Storage(StorageInterface):
                     s3_key,
                     ExtraArgs={"ContentType": "video/mp4"},
                 )
-            logger.info(f"Streamed clip file to S3: {s3_key}")
+            logger.info(f"Streamed moment file to S3: {s3_key}")
             return s3_key
         except ClientError as e:
-            logger.error(f"Error streaming clip to S3: {str(e)}")
-            raise Exception(f"Failed to stream clip to S3: {str(e)}")
+            logger.error(f"Error streaming moment to S3: {str(e)}")
+            raise Exception(f"Failed to stream moment to S3: {str(e)}")
         except Exception as e:
-            logger.error(f"Error reading clip file for S3 upload: {str(e)}")
-            raise Exception(f"Failed to read clip file for upload: {str(e)}")
+            logger.error(f"Error reading moment file for S3 upload: {str(e)}")
+            raise Exception(f"Failed to read moment file for upload: {str(e)}")
 
     def store_thumbnail_from_file(self, file_path: str, filename: str) -> str:
         """

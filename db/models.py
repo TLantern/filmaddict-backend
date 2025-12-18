@@ -15,13 +15,14 @@ class Video(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     storage_path = Column(String, nullable=False)
     duration = Column(Float, nullable=True)
+    aspect_ratio = Column(String, nullable=True, default="16:9")  # 9:16, 16:9, 1:1, 4:5, original
     status = Column(String, nullable=False, default=VideoStatus.UPLOADED.value)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     transcripts = relationship("Transcript", back_populates="video", cascade="all, delete-orphan")
     highlights = relationship("Highlight", back_populates="video", cascade="all, delete-orphan")
-    clips = relationship("Clip", back_populates="video", cascade="all, delete-orphan")
+    moments = relationship("Moment", back_populates="video", cascade="all, delete-orphan")
 
     __table_args__ = (Index("idx_videos_status", "status"), Index("idx_videos_created_at", "created_at"))
 
@@ -46,7 +47,8 @@ class Highlight(Base):
     video_id = Column(UUID(as_uuid=True), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False)
     start = Column(Float, nullable=False)
     end = Column(Float, nullable=False)
-    reason = Column(String, nullable=False)
+    title = Column(String, nullable=True)  # Short catchy title for the moment
+    summary = Column(Text, nullable=True)  # 2-3 sentence summary of moment content
     score = Column(Float, nullable=False)
     prompt_version_id = Column(UUID(as_uuid=True), ForeignKey("prompt_versions.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -62,8 +64,8 @@ class Highlight(Base):
     )
 
 
-class Clip(Base):
-    __tablename__ = "clips"
+class Moment(Base):
+    __tablename__ = "moments"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     video_id = Column(UUID(as_uuid=True), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False)
@@ -73,10 +75,10 @@ class Clip(Base):
     thumbnail_path = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
-    video = relationship("Video", back_populates="clips")
-    saved_clips = relationship("SavedClip", back_populates="clip", cascade="all, delete-orphan")
+    video = relationship("Video", back_populates="moments")
+    saved_moments = relationship("SavedMoment", back_populates="moment", cascade="all, delete-orphan")
 
-    __table_args__ = (Index("idx_clips_video_id", "video_id"),)
+    __table_args__ = (Index("idx_moments_video_id", "video_id"),)
 
 
 class HighlightFeedback(Base):
@@ -85,7 +87,7 @@ class HighlightFeedback(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     highlight_id = Column(UUID(as_uuid=True), ForeignKey("highlights.id", ondelete="CASCADE"), nullable=False)
     feedback_type = Column(String, nullable=False)
-    rating = Column(Float, nullable=True)  # Now supports 0-100 scale
+    confidence_score = Column(Float, nullable=True)  # Confidence score 0-100 scale
     text_feedback = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -109,8 +111,8 @@ class PromptVersion(Base):
     performance_metrics = Column(JSONB, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     total_rated = Column(Integer, nullable=False, default=0)
-    sum_ratings = Column(Float, nullable=False, default=0.0)
-    avg_rating = Column(Float, nullable=False, default=0.0)
+    sum_confidence_scores = Column(Float, nullable=False, default=0.0)
+    avg_confidence_score = Column(Float, nullable=False, default=0.0)
     num_positive = Column(Integer, nullable=False, default=0)
     num_negative = Column(Integer, nullable=False, default=0)
     positive_rate = Column(Float, nullable=False, default=0.0)
@@ -126,20 +128,20 @@ class PromptVersion(Base):
     )
 
 
-class SavedClip(Base):
-    __tablename__ = "saved_clips"
+class SavedMoment(Base):
+    __tablename__ = "saved_moments"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
-    clip_id = Column(UUID(as_uuid=True), ForeignKey("clips.id", ondelete="CASCADE"), nullable=False)
+    moment_id = Column(UUID(as_uuid=True), ForeignKey("moments.id", ondelete="CASCADE"), nullable=False)
     highlight_id = Column(UUID(as_uuid=True), ForeignKey("highlights.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
-    clip = relationship("Clip", back_populates="saved_clips")
+    moment = relationship("Moment", back_populates="saved_moments")
     highlight = relationship("Highlight")
 
     __table_args__ = (
-        Index("idx_saved_clips_clip_id", "clip_id"),
-        Index("idx_saved_clips_highlight_id", "highlight_id"),
+        Index("idx_saved_moments_moment_id", "moment_id"),
+        Index("idx_saved_moments_highlight_id", "highlight_id"),
     )
 
 

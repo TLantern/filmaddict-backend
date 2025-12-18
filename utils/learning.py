@@ -122,9 +122,9 @@ async def update_calibration_from_feedback(
     actual_ratings = []
     
     for feedback in feedback_list:
-        if feedback.rating is not None and feedback.highlight:
+        if feedback.confidence_score is not None and feedback.highlight:
             predicted_scores.append(feedback.highlight.score)
-            actual_ratings.append(feedback.rating)
+            actual_ratings.append(feedback.confidence_score)
     
     if len(predicted_scores) < MIN_FEEDBACK_THRESHOLD:
         return None
@@ -172,13 +172,13 @@ def extract_feedback_patterns(feedback_data: List[HighlightFeedback]) -> Dict[st
         # Only use editor quality feedback: POSITIVE, NEGATIVE, and RATING
         # SKIP is a view-based metric and not used for learning patterns
         if feedback.feedback_type == FeedbackType.POSITIVE.value or (
-            feedback.feedback_type == FeedbackType.RATING.value and feedback.rating and feedback.rating >= 70
+            feedback.feedback_type == FeedbackType.CONFIDENCE_SCORE.value and feedback.confidence_score and feedback.confidence_score >= 70
         ):
             successful_highlights.append(highlight)
             if feedback.text_feedback:
                 successful_text_feedback.append(feedback.text_feedback.lower())
         elif feedback.feedback_type == FeedbackType.NEGATIVE.value or (
-            feedback.feedback_type == FeedbackType.RATING.value and feedback.rating and feedback.rating < 70
+            feedback.feedback_type == FeedbackType.CONFIDENCE_SCORE.value and feedback.confidence_score and feedback.confidence_score < 70
         ):
             failed_highlights.append(highlight)
             if feedback.text_feedback:
@@ -199,13 +199,15 @@ def extract_feedback_patterns(feedback_data: List[HighlightFeedback]) -> Dict[st
         duration = highlight.end - highlight.start
         patterns["successful_durations"].append(duration)
         patterns["successful_scores"].append(highlight.score)
-        patterns["successful_reasons"].append(highlight.reason.lower())
+        if highlight.summary:
+            patterns["successful_reasons"].append(highlight.summary.lower())
     
     for highlight in failed_highlights:
         duration = highlight.end - highlight.start
         patterns["failed_durations"].append(duration)
         patterns["failed_scores"].append(highlight.score)
-        patterns["failed_reasons"].append(highlight.reason.lower())
+        if highlight.summary:
+            patterns["failed_reasons"].append(highlight.summary.lower())
     
     return patterns
 
@@ -343,7 +345,7 @@ async def evaluate_prompt_performance(
     
     # Return rolling metrics directly from PromptVersion columns
     metrics = {
-        "avg_rating": prompt_version.avg_rating,  # 0-100 scale
+        "avg_rating": prompt_version.avg_confidence_score,  # 0-100 scale
         "save_rate": prompt_version.save_rate,
         "positive_rate": prompt_version.positive_rate,
         "negative_rate": prompt_version.negative_rate,

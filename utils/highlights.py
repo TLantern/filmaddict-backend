@@ -61,9 +61,9 @@ def _ends_with_complete_sentence(text: str) -> bool:
     return bool(re.search(pattern, text))
 
 
-def chunk_transcript(segments: List[TranscriptSegment], max_window_seconds: float = 60.0) -> List[TranscriptChunk]:
+def chunk_transcript(segments: List[TranscriptSegment], max_window_seconds: float = 90.0) -> List[TranscriptChunk]:
     """
-    Group transcript segments into chunks of approximately 30-60 seconds while respecting sentence boundaries.
+    Group transcript segments into chunks of approximately 30-90 seconds while respecting sentence boundaries.
     
     Args:
         segments: List of transcript segments to chunk
@@ -179,7 +179,8 @@ async def _analyze_chunk(
                 for h in highlights_data:
                     start = float(h.get("start", 0))
                     end = float(h.get("end", 0))
-                    reason = str(h.get("reason", ""))
+                    title = str(h.get("title", "")) or None
+                    summary = str(h.get("summary", "")) or None
                     score = float(h.get("score", 0))
                     
                     start = max(start, chunk.start)
@@ -187,11 +188,19 @@ async def _analyze_chunk(
                     if start >= end:
                         continue
                     
+                    # Validate duration: must be 20-30s or 50-60s
+                    duration = end - start
+                    is_short_clip = 20 <= duration <= 30
+                    is_long_clip = 50 <= duration <= 60
+                    if not (is_short_clip or is_long_clip):
+                        logger.debug(f"Skipping highlight with invalid duration {duration:.1f}s (must be 20-30s or 50-60s)")
+                        continue
+                    
                     score = max(1, min(10, score))
                     
                     # Only include highlights scoring 6.0 or higher
-                    if score >= 6.0 and reason:
-                        highlights.append(Highlight(start=start, end=end, reason=reason, score=score))
+                    if score >= 6.0 and summary:
+                        highlights.append(Highlight(start=start, end=end, title=title, summary=summary, score=score))
                 
                 logger.info(f"Found {len(highlights)} highlights in chunk {chunk.start:.2f}-{chunk.end:.2f}s")
                 return highlights
@@ -223,6 +232,7 @@ async def find_highlights_async(
     default_system_prompt = (
         "You are an expert storytelling editor for short-form video. "
         "You identify moments that feel like mini-stories with a clear beginning, middle, and end. "
+        "Start clips on powerful hooks—first-person statements ('I', 'We') or emotionally charged language. "
         "Favor clips that include enough setup and aftermath for viewers to understand the context "
         "even if they have not seen the rest of the video. "
         "Return only valid JSON objects with a 'highlights' key containing an array."
@@ -230,13 +240,19 @@ async def find_highlights_async(
     default_user_template = """Chunk time range: {start:.2f} - {end:.2f} seconds
 Transcript text: {text}
 
-Your job is to find short moments that work as self-contained stories.
+Your job is to find moments that work as self-contained stories.
+
+**CRITICAL DURATION REQUIREMENT:**
+Clips MUST be either 20-30 seconds OR 50-60 seconds long. Do NOT return clips outside these ranges.
+- Short clips: 20-30 seconds (quick impactful moments)
+- Long clips: 50-60 seconds (deeper stories with full context)
 
 Identify the most engaging, emotionally intense, or information-dense moments that would perform well as short-form content, **while preserving narrative context**. For each candidate:
-- Include a bit of lead-in so the viewer understands who/what is being discussed before the key moment.
+- **START clips on hook moments**: Begin when the speaker says "I", "We", "You", or emotionally charged words (e.g., "never", "always", "worst", "best", "crazy", "unbelievable", "shocking").
+- Prioritize starting near emotionally evoking language that grabs attention immediately.
 - Avoid starting or ending in the middle of a sentence unless absolutely necessary.
 - Prefer ranges where the speaker completes a thought or point (a mini beginning → middle → end).
-- It is OK if the suggested range is slightly longer so the moment still makes sense on its own.
+- Extend or trim the range to fit within the required duration brackets (20-30s or 50-60s).
 
 **IMPORTANT: Scoring Guidelines**
 Use the full 1-10 range and be highly selective. Most moments should score 5-7. Only truly exceptional moments score 8+. Reserve 9-10 for the absolute best.
@@ -250,14 +266,15 @@ Score rubric:
 
 **Only return highlights scoring 6.0 or higher.** Return 0–1 timestamp range per chunk (be highly selective - only the best moment).
 
-Return your response as a JSON object with a "highlights" key containing an array. Each highlight must have: start (seconds), end (seconds), reason (string), score (1-10).
+Return your response as a JSON object with a "highlights" key containing an array. Each highlight must have: start (seconds), end (seconds), title (short catchy title), summary (2-3 sentences describing what happens), score (1-10).
 Example format:
 {{
   "highlights": [
     {{
-      "start": 120.5,
-      "end": 145.2,
-      "reason": "Clear mini-story with setup, emotional peak, and satisfying resolution",
+      "start": 120.0,
+      "end": 145.0,
+      "title": "The Moment Everything Changed",
+      "summary": "The speaker reveals a pivotal moment from their past. They explain how this experience fundamentally changed their perspective and set them on their current path.",
       "score": 8.5
     }}
   ]
@@ -348,7 +365,8 @@ def redistribute_scores(highlights: List[Highlight]) -> List[Highlight]:
         redistributed.append(Highlight(
             start=highlight.start,
             end=highlight.end,
-            reason=highlight.reason,
+            title=highlight.title,
+            summary=highlight.summary,
             score=new_score
         ))
     
@@ -401,7 +419,8 @@ async def aggregate_and_rank_highlights(
             Highlight(
                 start=highlight.start,
                 end=highlight.end,
-                reason=highlight.reason,
+                title=highlight.title,
+                summary=highlight.summary,
                 score=calibrated_score
             )
         )

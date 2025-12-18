@@ -99,7 +99,8 @@ class TranscriptChunk(BaseModel):
 class Highlight(BaseModel):
     start: float = Field(..., ge=0, description="Start time in seconds")
     end: float = Field(..., ge=0, description="End time in seconds")
-    reason: str = Field(..., description="Reason why this is a highlight")
+    title: Optional[str] = Field(None, description="Short catchy title for the moment")
+    summary: Optional[str] = Field(None, description="2-3 sentence summary of what happens in the moment")
     score: float = Field(..., ge=1, le=10, description="Score from 1 to 10")
 
     model_config = ConfigDict(
@@ -107,14 +108,15 @@ class Highlight(BaseModel):
             "example": {
                 "start": 120.0,
                 "end": 180.0,
-                "reason": "High emotional intensity moment",
+                "title": "The Moment Everything Changed",
+                "summary": "The speaker shares a pivotal moment from their childhood. They describe how this experience shaped their worldview and led to their career path.",
                 "score": 8.5,
             }
         }
     )
 
 
-class ClipRecord(BaseModel):
+class MomentRecord(BaseModel):
     id: UUID
     video_id: UUID
     start: float = Field(..., ge=0, description="Start time in seconds")
@@ -130,7 +132,7 @@ class ClipRecord(BaseModel):
                 "video_id": "123e4567-e89b-12d3-a456-426614174000",
                 "start": 120.0,
                 "end": 180.0,
-                "storage_path": "/clips/clip_123.mp4",
+                "storage_path": "/moments/moment_123.mp4",
                 "thumbnail_path": "/thumbnails/thumb_123.jpg",
             }
         },
@@ -204,9 +206,9 @@ class HighlightsResponse(BaseModel):
     )
 
 
-class ClipResponse(BaseModel):
+class MomentResponse(BaseModel):
     id: UUID
-    clip_url: str = Field(..., description="URL to download the clip")
+    moment_url: str = Field(..., description="URL to download the moment")
     start: float = Field(..., ge=0, description="Start time in seconds")
     end: float = Field(..., ge=0, description="End time in seconds")
     thumbnail_url: Optional[str] = Field(None, description="URL to the thumbnail image")
@@ -216,31 +218,31 @@ class ClipResponse(BaseModel):
         json_schema_extra={
             "example": {
                 "id": "123e4567-e89b-12d3-a456-426614174001",
-                "clip_url": "/clips/123e4567-e89b-12d3-a456-426614174001/download",
+                "moment_url": "/moments/123e4567-e89b-12d3-a456-426614174001/download",
                 "start": 120.0,
                 "end": 180.0,
-                "thumbnail_url": "/clips/123e4567-e89b-12d3-a456-426614174001/thumbnail",
+                "thumbnail_url": "/moments/123e4567-e89b-12d3-a456-426614174001/thumbnail",
             }
         },
     )
 
 
-class ClipsResponse(BaseModel):
+class MomentsResponse(BaseModel):
     video_id: UUID
-    clips: List[ClipResponse]
+    moments: List[MomentResponse]
 
     model_config = ConfigDict(
         json_encoders={UUID: str},
         json_schema_extra={
             "example": {
                 "video_id": "123e4567-e89b-12d3-a456-426614174000",
-                "clips": [
+                "moments": [
                     {
                         "id": "123e4567-e89b-12d3-a456-426614174001",
-                        "clip_url": "/clips/123e4567-e89b-12d3-a456-426614174001/download",
+                        "moment_url": "/moments/123e4567-e89b-12d3-a456-426614174001/download",
                         "start": 120.0,
                         "end": 180.0,
-                        "thumbnail_url": "/clips/123e4567-e89b-12d3-a456-426614174001/thumbnail",
+                        "thumbnail_url": "/moments/123e4567-e89b-12d3-a456-426614174001/thumbnail",
                     }
                 ],
             }
@@ -254,19 +256,19 @@ class FeedbackType(str, Enum):
     VIEW = "view"
     SKIP = "skip"
     SHARE = "share"
-    RATING = "rating"
+    CONFIDENCE_SCORE = "confidence_score"
 
 
 class HighlightFeedbackRequest(BaseModel):
     feedback_type: FeedbackType = Field(..., description="Type of feedback")
-    rating: Optional[float] = Field(None, ge=0, le=100, description="Rating from 0-100 (required for rating type)")
+    confidence_score: Optional[float] = Field(None, ge=0, le=100, description="Confidence score from 0-100 (required for confidence_score type)")
     text_feedback: Optional[str] = Field(None, description="Optional text feedback")
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "feedback_type": "rating",
-                "rating": 85.0,
+                "feedback_type": "confidence_score",
+                "confidence_score": 85.0,
                 "text_feedback": "Great moment!",
             }
         }
@@ -281,8 +283,8 @@ class FeedbackAnalyticsResponse(BaseModel):
     view_count: int
     skip_count: int
     share_count: int
-    average_rating: Optional[float] = Field(None, description="Average rating if ratings exist")
-    rating_count: int
+    average_confidence_score: Optional[float] = Field(None, description="Average confidence score if scores exist")
+    confidence_score_count: int
     created_at: datetime
 
     model_config = ConfigDict(
@@ -296,8 +298,8 @@ class FeedbackAnalyticsResponse(BaseModel):
                 "view_count": 20,
                 "skip_count": 5,
                 "share_count": 3,
-                "average_rating": 7.8,
-                "rating_count": 10,
+                "average_confidence_score": 78.0,
+                "confidence_score_count": 10,
                 "created_at": "2024-01-01T00:00:00Z",
             }
         },
@@ -322,7 +324,7 @@ class PromptVersionResponse(BaseModel):
                 "system_prompt": "You are an expert...",
                 "user_prompt_template": "Chunk time range...",
                 "is_active": True,
-                "performance_metrics": {"avg_rating": 75.0, "save_rate": 0.2, "sample_size": 50},
+                "performance_metrics": {"avg_confidence_score": 75.0, "save_rate": 0.2, "sample_size": 50},
                 "created_at": "2024-01-01T00:00:00Z",
             }
         },
@@ -345,21 +347,21 @@ class PromptVersionRequest(BaseModel):
     )
 
 
-class ClipFeedbackRequest(BaseModel):
-    rating: float = Field(..., ge=0, le=100, description="Rating from 0-100")
+class MomentFeedbackRequest(BaseModel):
+    confidence_score: float = Field(..., ge=0, le=100, description="Confidence score from 0-100")
     text_feedback: Optional[str] = Field(None, description="Optional text feedback")
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "rating": 85.0,
-                "text_feedback": "Great clip!",
+                "confidence_score": 85.0,
+                "text_feedback": "Great moment!",
             }
         }
     )
 
 
-class EditClipRequest(BaseModel):
+class EditMomentRequest(BaseModel):
     new_start: float = Field(..., ge=0, description="New start time in seconds")
     new_end: float = Field(..., ge=0, description="New end time in seconds")
 
@@ -373,7 +375,7 @@ class EditClipRequest(BaseModel):
     )
 
 
-class ClipDetailResponse(BaseModel):
+class MomentDetailResponse(BaseModel):
     id: UUID
     video_id: UUID
     start: float = Field(..., ge=0, description="Start time in seconds")
@@ -392,15 +394,15 @@ class ClipDetailResponse(BaseModel):
                 "end": 180.0,
                 "video_url": "https://s3.amazonaws.com/bucket/videos/video.mp4",
                 "video_duration": 3600.0,
-                "thumbnail_url": "/clips/123e4567-e89b-12d3-a456-426614174001/thumbnail",
+                "thumbnail_url": "/moments/123e4567-e89b-12d3-a456-426614174001/thumbnail",
             }
         }
     )
 
 
-class SavedClipResponse(BaseModel):
+class SavedMomentResponse(BaseModel):
     id: UUID
-    clip_id: UUID
+    moment_id: UUID
     highlight_id: Optional[UUID] = None
     created_at: datetime
 
@@ -409,7 +411,7 @@ class SavedClipResponse(BaseModel):
         json_schema_extra={
             "example": {
                 "id": "123e4567-e89b-12d3-a456-426614174001",
-                "clip_id": "123e4567-e89b-12d3-a456-426614174002",
+                "moment_id": "123e4567-e89b-12d3-a456-426614174002",
                 "highlight_id": "123e4567-e89b-12d3-a456-426614174003",
                 "created_at": "2024-01-01T00:00:00Z",
             }
@@ -437,7 +439,7 @@ class ProjectResponse(BaseModel):
     video_id: UUID
     created_at: datetime
     duration: Optional[float] = Field(None, description="Video duration in seconds")
-    clip_count: int = Field(..., description="Number of clips in this project")
+    moment_count: int = Field(..., description="Number of moments in this project")
 
     model_config = ConfigDict(
         json_encoders={UUID: str},
@@ -446,7 +448,7 @@ class ProjectResponse(BaseModel):
                 "video_id": "123e4567-e89b-12d3-a456-426614174000",
                 "created_at": "2024-01-01T00:00:00Z",
                 "duration": 3600.5,
-                "clip_count": 5,
+                "moment_count": 5,
             }
         },
     )
@@ -463,7 +465,7 @@ class ProjectsResponse(BaseModel):
                         "video_id": "123e4567-e89b-12d3-a456-426614174000",
                         "created_at": "2024-01-01T00:00:00Z",
                         "duration": 3600.5,
-                        "clip_count": 5,
+                        "moment_count": 5,
                     }
                 ]
             }

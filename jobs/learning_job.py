@@ -55,6 +55,7 @@ async def run_learning_pipeline(db: AsyncSession) -> Dict[str, any]:
     
     try:
         logger.info("Starting learning pipeline")
+        await db.commit()  # Commit any pending transactions
         
         # Step 1: Update calibration from feedback
         try:
@@ -79,6 +80,7 @@ async def run_learning_pipeline(db: AsyncSession) -> Dict[str, any]:
                     )
         except Exception as e:
             logger.error(f"Error updating calibration: {str(e)}", exc_info=True)
+            await db.rollback()
         
         # Step 2: Evaluate all prompt versions
         try:
@@ -95,7 +97,7 @@ async def run_learning_pipeline(db: AsyncSession) -> Dict[str, any]:
             for version in prompt_versions:
                 metrics = await evaluate_prompt_performance(db, version.id, days=LEARNING_DAYS)
                 previous_metrics = {
-                    "avg_rating": version.avg_rating,
+                    "avg_rating": version.avg_confidence_score,
                     "save_rate": version.save_rate,
                     "positive_rate": version.positive_rate,
                     "negative_rate": version.negative_rate,
@@ -181,6 +183,7 @@ async def run_learning_pipeline(db: AsyncSession) -> Dict[str, any]:
                     logger.info(f"Insufficient feedback for prompt generation: {len(feedback_list)} < {MIN_FEEDBACK_FOR_NEW_PROMPT}")
             except Exception as e:
                 logger.error(f"Error generating new prompt: {str(e)}", exc_info=True)
+                await db.rollback()
             
             # Step 4: Promote best performing version if significant improvement
             if best_version and best_metrics:
@@ -244,11 +247,13 @@ async def run_learning_pipeline(db: AsyncSession) -> Dict[str, any]:
         
         except Exception as e:
             logger.error(f"Error evaluating prompts: {str(e)}", exc_info=True)
+            await db.rollback()
         
         logger.info("Learning pipeline completed")
         return result
     
     except Exception as e:
         logger.error(f"Error in learning pipeline: {str(e)}", exc_info=True)
+        await db.rollback()
         raise
 

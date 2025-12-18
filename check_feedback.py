@@ -29,8 +29,8 @@ async def check_feedback():
         stats_result = await db.execute(
             select(
                 func.count(HighlightFeedback.id).label('total'),
-                func.count(HighlightFeedback.rating).label('ratings'),
-                func.avg(HighlightFeedback.rating).label('avg_rating'),
+                func.count(HighlightFeedback.confidence_score).label('ratings'),
+                func.avg(HighlightFeedback.confidence_score).label('avg_rating'),
                 func.count(HighlightFeedback.text_feedback).label('text_feedback_count')
             )
         )
@@ -40,8 +40,8 @@ async def check_feedback():
         print("FEEDBACK SUMMARY")
         print("=" * 80)
         print(f"Total feedback records: {stats.total}")
-        print(f"Records with ratings: {stats.ratings}")
-        print(f"Average rating: {stats.avg_rating:.2f}" if stats.avg_rating else "Average rating: N/A")
+        print(f"Records with confidence scores: {stats.ratings}")
+        print(f"Average confidence score: {stats.avg_rating:.2f}" if stats.avg_rating else "Average confidence score: N/A")
         print(f"Records with text feedback: {stats.text_feedback_count}")
         print()
         
@@ -56,12 +56,13 @@ async def check_feedback():
         for i, feedback in enumerate(all_feedback[:20], 1):
             print(f"\n{i}. Feedback ID: {feedback.id}")
             print(f"   Type: {feedback.feedback_type}")
-            print(f"   Rating: {feedback.rating}" if feedback.rating else "   Rating: None")
+            print(f"   Confidence Score: {feedback.confidence_score}" if feedback.confidence_score else "   Confidence Score: None")
             print(f"   Text: {feedback.text_feedback[:100] + '...' if feedback.text_feedback and len(feedback.text_feedback) > 100 else feedback.text_feedback or 'None'}")
             print(f"   Created: {feedback.created_at}")
             if feedback.highlight:
                 print(f"   Highlight: {feedback.highlight.start:.1f}s - {feedback.highlight.end:.1f}s")
-                print(f"   Reason: {feedback.highlight.reason[:80] + '...' if len(feedback.highlight.reason) > 80 else feedback.highlight.reason}")
+                if feedback.highlight.summary:
+                    print(f"   Summary: {feedback.highlight.summary[:80] + '...' if len(feedback.highlight.summary) > 80 else feedback.highlight.summary}")
         
         if len(all_feedback) > 20:
             print(f"\n... and {len(all_feedback) - 20} more feedback records")
@@ -77,11 +78,11 @@ async def check_feedback():
         for feedback_type, count in sorted(type_counts.items()):
             print(f"{feedback_type}: {count}")
         
-        # Show ratings distribution
-        ratings = [f.rating for f in all_feedback if f.rating is not None]
+        # Show confidence scores distribution
+        ratings = [f.confidence_score for f in all_feedback if f.confidence_score is not None]
         if ratings:
             print("\n" + "=" * 80)
-            print("RATING DISTRIBUTION")
+            print("CONFIDENCE SCORE DISTRIBUTION")
             print("=" * 80)
             print(f"Min: {min(ratings):.1f}")
             print(f"Max: {max(ratings):.1f}")

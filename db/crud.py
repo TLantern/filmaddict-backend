@@ -7,16 +7,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 
-from db.models import Video, Transcript, Highlight, Clip, HighlightFeedback, PromptVersion, CalibrationConfig, SavedClip
+from db.models import Video, Transcript, Highlight, Moment, HighlightFeedback, PromptVersion, CalibrationConfig, SavedMoment
 from models import VideoStatus, FeedbackType
 
 logger = logging.getLogger(__name__)
 
 
 async def create_video(
-    db: AsyncSession, storage_path: str, duration: Optional[float] = None, status: VideoStatus = VideoStatus.UPLOADED
+    db: AsyncSession, storage_path: str, duration: Optional[float] = None, status: VideoStatus = VideoStatus.UPLOADED, aspect_ratio: Optional[str] = "16:9"
 ) -> Video:
-    video = Video(storage_path=storage_path, duration=duration, status=status.value)
+    video = Video(storage_path=storage_path, duration=duration, aspect_ratio=aspect_ratio, status=status.value)
     db.add(video)
     await db.flush()
     await db.commit()
@@ -54,9 +54,9 @@ async def get_transcript_by_video_id(db: AsyncSession, video_id: UUID) -> Option
 
 
 async def create_highlight(
-    db: AsyncSession, video_id: UUID, start: float, end: float, reason: str, score: float, prompt_version_id: Optional[UUID] = None
+    db: AsyncSession, video_id: UUID, start: float, end: float, score: float, title: Optional[str] = None, summary: Optional[str] = None, prompt_version_id: Optional[UUID] = None
 ) -> Highlight:
-    highlight = Highlight(video_id=video_id, start=start, end=end, reason=reason, score=score, prompt_version_id=prompt_version_id)
+    highlight = Highlight(video_id=video_id, start=start, end=end, title=title, summary=summary, score=score, prompt_version_id=prompt_version_id)
     db.add(highlight)
     await db.commit()
     await db.refresh(highlight)
@@ -70,100 +70,115 @@ async def get_highlights_by_video_id(db: AsyncSession, video_id: UUID) -> List[H
     return list(result.scalars().all())
 
 
-async def create_clip(
+async def create_moment(
     db: AsyncSession,
     video_id: UUID,
     start: float,
     end: float,
     storage_path: str,
     thumbnail_path: Optional[str] = None,
-) -> Clip:
-    clip = Clip(
+) -> Moment:
+    moment = Moment(
         video_id=video_id, start=start, end=end, storage_path=storage_path, thumbnail_path=thumbnail_path
     )
-    db.add(clip)
+    db.add(moment)
     await db.commit()
-    await db.refresh(clip)
-    return clip
+    await db.refresh(moment)
+    return moment
 
 
-async def get_clips_by_video_id(db: AsyncSession, video_id: UUID) -> List[Clip]:
-    result = await db.execute(select(Clip).where(Clip.video_id == video_id).order_by(Clip.start))
+async def get_moments_by_video_id(db: AsyncSession, video_id: UUID) -> List[Moment]:
+    result = await db.execute(select(Moment).where(Moment.video_id == video_id).order_by(Moment.start))
     return list(result.scalars().all())
 
 
-async def get_all_clips(db: AsyncSession, limit: int = 100, offset: int = 0) -> List[Clip]:
+async def get_all_moments(db: AsyncSession, limit: int = 100, offset: int = 0) -> List[Moment]:
     result = await db.execute(
-        select(Clip).limit(limit).offset(offset).order_by(Clip.created_at.desc())
+        select(Moment).limit(limit).offset(offset).order_by(Moment.created_at.desc())
     )
     return list(result.scalars().all())
 
 
-async def get_videos_with_clips(db: AsyncSession) -> List[Video]:
-    """Get all videos that have at least one clip (projects)."""
+async def get_videos_with_moments(db: AsyncSession) -> List[Video]:
+    """Get all videos that have at least one moment (projects)."""
     from sqlalchemy import distinct
     try:
+        logger.info("[CRUD] Querying for videos with moments...")
+        # First check total moments count
+        total_moments_result = await db.execute(select(Moment))
+        total_moments = list(total_moments_result.scalars().all())
+        logger.info(f"[CRUD] Total moments in database: {len(total_moments)}")
+        if total_moments:
+            logger.info(f"[CRUD] Moments by video_id: {[(str(m.video_id), m.id) for m in total_moments[:10]]}")
+        
         video_ids_result = await db.execute(
-            select(distinct(Clip.video_id))
+            select(distinct(Moment.video_id))
         )
         video_ids = [row[0] for row in video_ids_result.all()]
+        logger.info(f"[CRUD] Found {len(video_ids)} distinct video IDs with moments: {[str(vid) for vid in video_ids]}")
         
         if not video_ids:
+            logger.info("[CRUD] No videos with moments found, returning empty list")
             return []
         
         result = await db.execute(
             select(Video)
             .where(Video.id.in_(video_ids))
             .order_by(Video.created_at.desc())
-            .options(selectinload(Video.clips))
+            .options(selectinload(Video.moments))
         )
-        return list(result.scalars().all())
+        videos = list(result.scalars().all())
+        logger.info(f"[CRUD] Retrieved {len(videos)} videos with moments loaded")
+        for video in videos:
+            logger.info(f"[CRUD] Video {video.id}: {len(video.moments)} moments, status={video.status}, duration={video.duration}")
+        return videos
     except Exception as e:
-        logger.error(f"Error getting videos with clips: {str(e)}", exc_info=True)
+        logger.error(f"[CRUD] Error getting videos with moments: {str(e)}", exc_info=True)
+        raise
         return []
 
 
-async def delete_all_clips(db: AsyncSession) -> int:
-    """Delete all clips from the database. Returns the number of clips deleted."""
+async def delete_all_moments(db: AsyncSession) -> int:
+    """Delete all videos from the database. Returns the number of videos deleted."""
     # Get count before deletion
-    result = await db.execute(select(Clip))
-    clips = list(result.scalars().all())
-    deleted_count = len(clips)
+    result = await db.execute(select(Moment))
+    moments = list(result.scalars().all())
+    deleted_count = len(moments)
     
-    # Delete all clips (cascade will handle saved_clips and feedback)
-    await db.execute(delete(Clip))
+    # Delete all moments (cascade will handle saved_moments and feedback)
+    await db.execute(delete(Moment))
     await db.commit()
     
     return deleted_count
 
 
-async def get_clip_by_id(db: AsyncSession, clip_id: UUID) -> Optional[Clip]:
-    result = await db.execute(select(Clip).where(Clip.id == clip_id))
+async def get_moment_by_id(db: AsyncSession, moment_id: UUID) -> Optional[Moment]:
+    result = await db.execute(select(Moment).where(Moment.id == moment_id))
     return result.scalar_one_or_none()
 
 
-async def update_clip(
+async def update_moment(
     db: AsyncSession,
-    clip_id: UUID,
+    moment_id: UUID,
     start: float,
     end: float,
     storage_path: str,
     thumbnail_path: Optional[str] = None,
-) -> Optional[Clip]:
-    """Update clip metadata."""
-    clip = await get_clip_by_id(db, clip_id)
-    if not clip:
+) -> Optional[Moment]:
+    """Update moment metadata."""
+    moment = await get_moment_by_id(db, moment_id)
+    if not moment:
         return None
     
-    clip.start = start
-    clip.end = end
-    clip.storage_path = storage_path
+    moment.start = start
+    moment.end = end
+    moment.storage_path = storage_path
     if thumbnail_path is not None:
-        clip.thumbnail_path = thumbnail_path
+        moment.thumbnail_path = thumbnail_path
     
     await db.commit()
-    await db.refresh(clip)
-    return clip
+    await db.refresh(moment)
+    return moment
 
 
 async def delete_video(db: AsyncSession, video_id: UUID) -> bool:
@@ -176,13 +191,13 @@ async def create_feedback(
     db: AsyncSession,
     highlight_id: UUID,
     feedback_type: str,
-    rating: Optional[float] = None,
+    confidence_score: Optional[float] = None,
     text_feedback: Optional[str] = None,
 ) -> HighlightFeedback:
     feedback = HighlightFeedback(
         highlight_id=highlight_id,
         feedback_type=feedback_type,
-        rating=rating,
+        confidence_score=confidence_score,
         text_feedback=text_feedback,
     )
     db.add(feedback)
@@ -196,7 +211,7 @@ async def create_feedback(
     
     # Log feedback received
     logger.info("[ONLINE-LEARNING] Feedback received | "
-                f"type={feedback.feedback_type} | rating={feedback.rating} | "
+                f"type={feedback.feedback_type} | confidence_score={feedback.confidence_score} | "
                 f"highlight_id={feedback.highlight_id} | prompt_version={prompt_version_id}")
     
     # Hook online learning updates
@@ -205,12 +220,12 @@ async def create_feedback(
         from utils.learning import update_calibration_online, update_prompt_version_metrics_online
         
         if highlight_obj:
-            # Update calibration for RATING feedback
-            if feedback_type == FeedbackType.RATING.value and rating is not None and highlight_obj.score is not None:
+            # Update calibration for CONFIDENCE_SCORE feedback
+            if feedback_type == FeedbackType.CONFIDENCE_SCORE.value and confidence_score is not None and highlight_obj.score is not None:
                 await update_calibration_online(
                     db,
                     highlight_id=highlight_id,
-                    rating=rating,
+                    confidence_score=confidence_score,
                     predicted_score=highlight_obj.score,
                 )
             
@@ -220,7 +235,7 @@ async def create_feedback(
                     db,
                     prompt_version_id=highlight_obj.prompt_version_id,
                     feedback_type=feedback_type,
-                    rating=rating,
+                    confidence_score=confidence_score,
                     is_save=False,
                 )
     except Exception as e:
@@ -250,11 +265,11 @@ async def get_feedback_stats(db: AsyncSession, highlight_id: UUID) -> dict:
         "view_count": 0,
         "skip_count": 0,
         "share_count": 0,
-        "average_rating": None,
-        "rating_count": 0,
+        "average_confidence_score": None,
+        "confidence_score_count": 0,
     }
     
-    ratings = []
+    confidence_scores = []
     for feedback in feedback_list:
         if feedback.feedback_type == FeedbackType.POSITIVE.value:
             stats["positive_count"] += 1
@@ -267,12 +282,12 @@ async def get_feedback_stats(db: AsyncSession, highlight_id: UUID) -> dict:
         elif feedback.feedback_type == FeedbackType.SHARE.value:
             stats["share_count"] += 1
         
-        if feedback.rating is not None:
-            ratings.append(feedback.rating)
+        if feedback.confidence_score is not None:
+            confidence_scores.append(feedback.confidence_score)
     
-    if ratings:
-        stats["average_rating"] = sum(ratings) / len(ratings)
-        stats["rating_count"] = len(ratings)
+    if confidence_scores:
+        stats["average_confidence_score"] = sum(confidence_scores) / len(confidence_scores)
+        stats["confidence_score_count"] = len(confidence_scores)
     
     return stats
 
@@ -360,7 +375,7 @@ async def update_prompt_version_metrics_online(
     db: AsyncSession,
     prompt_version_id: UUID,
     feedback_type: Optional[str] = None,
-    rating: Optional[float] = None,
+    confidence_score: Optional[float] = None,
     is_save: bool = False,
 ) -> Optional[PromptVersion]:
     """
@@ -369,8 +384,8 @@ async def update_prompt_version_metrics_online(
     Args:
         db: Database session
         prompt_version_id: Prompt version ID
-        feedback_type: Feedback type (RATING, POSITIVE, NEGATIVE) or None
-        rating: Rating value (0-100) if feedback_type is RATING
+        feedback_type: Feedback type (CONFIDENCE_SCORE, POSITIVE, NEGATIVE) or None
+        confidence_score: Confidence score value (0-100) if feedback_type is CONFIDENCE_SCORE
         is_save: True if this is a save event
         
     Returns:
@@ -386,9 +401,9 @@ async def update_prompt_version_metrics_online(
     update_values = {}
     
     # Update metrics based on feedback type
-    if feedback_type == FeedbackType.RATING.value and rating is not None:
+    if feedback_type == FeedbackType.CONFIDENCE_SCORE.value and confidence_score is not None:
         update_values["total_rated"] = PromptVersion.total_rated + 1
-        update_values["sum_ratings"] = PromptVersion.sum_ratings + rating
+        update_values["sum_confidence_scores"] = PromptVersion.sum_confidence_scores + confidence_score
     
     if feedback_type == FeedbackType.POSITIVE.value:
         update_values["num_positive"] = PromptVersion.num_positive + 1
@@ -411,7 +426,7 @@ async def update_prompt_version_metrics_online(
     
     # Recalculate derived fields
     if prompt_version.total_rated > 0:
-        prompt_version.avg_rating = prompt_version.sum_ratings / prompt_version.total_rated
+        prompt_version.avg_confidence_score = prompt_version.sum_confidence_scores / prompt_version.total_rated
         prompt_version.positive_rate = prompt_version.num_positive / prompt_version.total_rated
         prompt_version.negative_rate = prompt_version.num_negative / prompt_version.total_rated
         if prompt_version.total_saves > 0:
@@ -419,7 +434,7 @@ async def update_prompt_version_metrics_online(
         else:
             prompt_version.save_rate = 0.0
     else:
-        prompt_version.avg_rating = 0.0
+        prompt_version.avg_confidence_score = 0.0
         prompt_version.positive_rate = 0.0
         prompt_version.negative_rate = 0.0
         prompt_version.save_rate = 0.0
@@ -429,7 +444,7 @@ async def update_prompt_version_metrics_online(
         update(PromptVersion)
         .where(PromptVersion.id == prompt_version_id)
         .values(
-            avg_rating=prompt_version.avg_rating,
+            avg_confidence_score=prompt_version.avg_confidence_score,
             positive_rate=prompt_version.positive_rate,
             negative_rate=prompt_version.negative_rate,
             save_rate=prompt_version.save_rate,
@@ -441,7 +456,7 @@ async def update_prompt_version_metrics_online(
     # Log metric update if metrics were actually updated
     if update_values:
         logger.info(f"[METRIC-UPDATE] version={prompt_version_id} | "
-                    f"avg_rating={prompt_version.avg_rating:.2f} | "
+                    f"avg_confidence_score={prompt_version.avg_confidence_score:.2f} | "
                     f"sample_size={prompt_version.total_rated} | "
                     f"pos={prompt_version.num_positive} | neg={prompt_version.num_negative}")
     
@@ -487,7 +502,7 @@ async def create_or_update_calibration_config(
 async def update_calibration_config_online(
     db: AsyncSession,
     predicted_score: float,
-    actual_rating: float,
+    actual_confidence_score: float,
 ) -> Optional[CalibrationConfig]:
     """
     Update calibration config online with atomic increment operations.
@@ -495,7 +510,7 @@ async def update_calibration_config_online(
     Args:
         db: Database session
         predicted_score: Model's predicted score (1-10 scale)
-        actual_rating: User rating scaled to 1-10 (from 0-100)
+        actual_confidence_score: User confidence score scaled to 1-10 (from 0-100)
         
     Returns:
         Updated CalibrationConfig or None if error
@@ -511,7 +526,7 @@ async def update_calibration_config_online(
         config = CalibrationConfig(
             feedback_count=1,
             sum_predicted=predicted_score,
-            sum_actual=actual_rating,
+            sum_actual=actual_confidence_score,
             score_offset=0.0,
             sample_size=1,
             last_updated=datetime.utcnow(),
@@ -520,7 +535,7 @@ async def update_calibration_config_online(
         await db.commit()
         await db.refresh(config)
         avg_pred = predicted_score
-        avg_actual = actual_rating
+        avg_actual = actual_confidence_score
         logger.info(f"[CALIBRATION-UPDATE] count={config.feedback_count} | "
                     f"offset={config.score_offset:.3f} | "
                     f"avg_pred={avg_pred:.2f} | avg_actual={avg_actual:.2f}")
@@ -533,7 +548,7 @@ async def update_calibration_config_online(
         .values(
             feedback_count=CalibrationConfig.feedback_count + 1,
             sum_predicted=CalibrationConfig.sum_predicted + predicted_score,
-            sum_actual=CalibrationConfig.sum_actual + actual_rating,
+            sum_actual=CalibrationConfig.sum_actual + actual_confidence_score,
             last_updated=datetime.utcnow(),
         )
     )
@@ -587,18 +602,18 @@ async def update_highlight_prompt_version(
     return await db.execute(select(Highlight).where(Highlight.id == highlight_id)).scalar_one_or_none()
 
 
-async def create_saved_clip(
+async def create_saved_moment(
     db: AsyncSession,
-    clip_id: UUID,
+    moment_id: UUID,
     highlight_id: Optional[UUID] = None,
-) -> SavedClip:
-    saved_clip = SavedClip(
-        clip_id=clip_id,
+) -> SavedMoment:
+    saved_moment = SavedMoment(
+        moment_id=moment_id,
         highlight_id=highlight_id,
     )
-    db.add(saved_clip)
+    db.add(saved_moment)
     await db.commit()
-    await db.refresh(saved_clip)
+    await db.refresh(saved_moment)
     
     # Hook online learning updates for prompt metrics
     if highlight_id:
@@ -621,28 +636,28 @@ async def create_saved_clip(
             # Log error but don't fail the save creation
             logger.error(f"Error updating online learning metrics for save: {str(e)}", exc_info=True)
     
-    return saved_clip
+    return saved_moment
 
 
-async def delete_saved_clip(db: AsyncSession, clip_id: UUID) -> bool:
-    result = await db.execute(delete(SavedClip).where(SavedClip.clip_id == clip_id))
+async def delete_saved_moment(db: AsyncSession, moment_id: UUID) -> bool:
+    result = await db.execute(delete(SavedMoment).where(SavedMoment.moment_id == moment_id))
     await db.commit()
     return result.rowcount > 0
 
 
-async def get_saved_clip(db: AsyncSession, clip_id: UUID) -> Optional[SavedClip]:
-    result = await db.execute(select(SavedClip).where(SavedClip.clip_id == clip_id))
+async def get_saved_moment(db: AsyncSession, moment_id: UUID) -> Optional[SavedMoment]:
+    result = await db.execute(select(SavedMoment).where(SavedMoment.moment_id == moment_id))
     return result.scalar_one_or_none()
 
 
-async def is_clip_saved(db: AsyncSession, clip_id: UUID) -> bool:
-    saved_clip = await get_saved_clip(db, clip_id)
-    return saved_clip is not None
+async def is_moment_saved(db: AsyncSession, moment_id: UUID) -> bool:
+    saved_moment = await get_saved_moment(db, moment_id)
+    return saved_moment is not None
 
 
-async def get_all_saved_clips(db: AsyncSession, limit: int = 100, offset: int = 0) -> List[SavedClip]:
+async def get_all_saved_moments(db: AsyncSession, limit: int = 100, offset: int = 0) -> List[SavedMoment]:
     result = await db.execute(
-        select(SavedClip).limit(limit).offset(offset).order_by(SavedClip.created_at.desc())
+        select(SavedMoment).limit(limit).offset(offset).order_by(SavedMoment.created_at.desc())
     )
     return list(result.scalars().all())
 

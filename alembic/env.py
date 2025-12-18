@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
 from database import Base
-from db.models import Video, Transcript, Highlight, Clip
+from db.models import Video, Transcript, Highlight, Moment, HighlightFeedback, PromptVersion, SavedMoment, CalibrationConfig
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

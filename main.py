@@ -6,14 +6,14 @@ from pathlib import Path
 from uuid import UUID
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db, async_session_maker
-from db.models import Video, Transcript, Highlight as HighlightDB, Clip
+from db.models import Video, Transcript, Highlight as HighlightDB, Moment
 from db import crud
 from sqlalchemy import select
 from models import (
@@ -22,8 +22,8 @@ from models import (
     TranscriptSegment,
     VideoStatusResponse,
     HighlightsResponse,
-    ClipResponse,
-    ClipsResponse,
+    MomentResponse,
+    MomentsResponse,
     Highlight,
     HighlightFeedbackRequest,
     FeedbackAnalyticsResponse,
@@ -31,10 +31,10 @@ from models import (
     PromptVersionResponse,
     PromptVersionRequest,
     CalibrationConfigResponse,
-    ClipFeedbackRequest,
-    SavedClipResponse,
-    EditClipRequest,
-    ClipDetailResponse,
+    MomentFeedbackRequest,
+    SavedMomentResponse,
+    EditMomentRequest,
+    MomentDetailResponse,
     ProjectResponse,
     ProjectsResponse,
 )
@@ -43,7 +43,7 @@ from datetime import datetime
 from utils.storage import store_video, get_storage_instance, S3Storage, get_video_path
 from utils.youtube import download_youtube_video, validate_youtube_url
 from utils.jobs import enqueue_video_processing, start_worker, stop_worker, start_learning_worker, stop_learning_worker
-from utils.clips import generate_clip_async, generate_thumbnail_async, delete_clip_file
+from utils.moments import generate_moment_async, generate_thumbnail_async, delete_moment_file
 from utils.learning_logger import (
     get_learning_log,
     get_changes_by_type,
@@ -236,21 +236,28 @@ MAX_FILE_SIZE = 524288000  # 500MB in bytes
 
 class YouTubeRequest(BaseModel):
     youtube_url: str = Field(..., description="YouTube video URL")
+    aspect_ratio: Optional[str] = Field("16:9", description="Aspect ratio for generated clips (9:16, 16:9, 1:1, 4:5, original)")
 
 
 @app.post("/videos/upload", status_code=201)
 async def upload_video(
     file: UploadFile = File(...),
+    aspect_ratio: Optional[str] = Form("16:9"),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Upload a video file.
     
-    Accepts multipart/form-data with a video file.
+    Accepts multipart/form-data with a video file and optional aspect_ratio.
     Validates file size (max 500MB) and format (mp4, mov, mkv, avi, webm).
     Stores the file and creates a VideoRecord in the database.
     """
     try:
+        # Validate aspect ratio
+        valid_ratios = ["9:16", "16:9", "1:1", "4:5", "original"]
+        if aspect_ratio and aspect_ratio not in valid_ratios:
+            aspect_ratio = "16:9"
+        
         # Validate file extension
         if not file.filename:
             raise HTTPException(status_code=400, detail="Filename is required")
@@ -284,6 +291,7 @@ async def upload_video(
             db=db,
             storage_path=storage_path,
             status=VideoStatus.UPLOADED,
+            aspect_ratio=aspect_ratio,
         )
         
         # Enqueue background job to process the video
@@ -374,12 +382,19 @@ async def upload_youtube_video(
                 detail="Failed to store downloaded video",
             )
         
+        # Validate aspect ratio
+        aspect_ratio = request.aspect_ratio
+        valid_ratios = ["9:16", "16:9", "1:1", "4:5", "original"]
+        if aspect_ratio and aspect_ratio not in valid_ratios:
+            aspect_ratio = "16:9"
+        
         # Create video record in database
         video = await crud.create_video(
             db=db,
             storage_path=storage_path,
             duration=duration,
             status=VideoStatus.UPLOADED,
+            aspect_ratio=aspect_ratio,
         )
         
         # Enqueue background job to process the video
@@ -458,10 +473,17 @@ async def get_video_status(
     """
     try:
         video_uuid = UUID(video_id)
+        logger.info(f"[Backend] /videos/{video_id}/status endpoint called")
         video = await crud.get_video_by_id(db, video_uuid)
         
         if not video:
+            logger.warning(f"[Backend] Video {video_id} not found")
             raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get moment count for logging
+        moments_db = await crud.get_moments_by_video_id(db, video_uuid)
+        moments_count = len(moments_db)
+        logger.info(f"[Backend] Video {video_id} status: {video.status}, duration: {video.duration}, moments: {moments_count}")
         
         return VideoStatusResponse(
             video_id=video.id,
@@ -500,17 +522,20 @@ async def get_highlights(
             raise HTTPException(status_code=404, detail="Video not found")
         
         highlights_db = await crud.get_highlights_by_video_id(db, video_uuid)
+        logger.info(f"[Backend] /videos/{video_id}/highlights - Found {len(highlights_db)} highlights")
         
         highlights = [
             Highlight(
                 start=h.start,
                 end=h.end,
-                reason=h.reason,
+                title=h.title,
+                summary=h.summary,
                 score=h.score,
             )
             for h in highlights_db
         ]
         
+        logger.info(f"[Backend] Returning {len(highlights)} highlights for video {video_id}")
         return HighlightsResponse(video_id=video_uuid, highlights=highlights)
     
     except ValueError:
@@ -522,16 +547,16 @@ async def get_highlights(
         raise HTTPException(status_code=500, detail="Internal server error retrieving highlights")
 
 
-@app.get("/videos/{video_id}/clips", response_model=ClipsResponse)
-async def get_clips(
+@app.get("/videos/{video_id}/moments", response_model=MomentsResponse)
+async def get_moments(
     video_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Retrieve clips for a video.
+    Retrieve moments for a video.
     
-    Returns list of clip metadata with clip_url, start, end, and thumbnail_url.
-    Returns empty list if no clips found.
+    Returns list of moment metadata with moment_url, start, end, and thumbnail_url.
+    Returns empty list if no moments found.
     Returns 404 if video not found.
     """
     try:
@@ -542,52 +567,178 @@ async def get_clips(
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
         
-        clips_db = await crud.get_clips_by_video_id(db, video_uuid)
+        moments_db = await crud.get_moments_by_video_id(db, video_uuid)
+        logger.info(f"[Backend] /videos/{video_id}/moments - Found {len(moments_db)} moments in database")
         
-        clips = [
-            ClipResponse(
-                id=clip.id,
-                clip_url=f"/clips/{clip.id}/download",
-                start=clip.start,
-                end=clip.end,
-                thumbnail_url=f"/clips/{clip.id}/thumbnail",
+        moments = [
+            MomentResponse(
+                id=moment.id,
+                moment_url=f"/moments/{moment.id}/download",
+                start=moment.start,
+                end=moment.end,
+                thumbnail_url=f"/moments/{moment.id}/thumbnail",
             )
-            for clip in clips_db
+            for moment in moments_db
         ]
         
-        return ClipsResponse(video_id=video_uuid, clips=clips)
+        logger.info(f"[Backend] Returning {len(moments)} moments for video {video_id}: {[str(m.id) for m in moments]}")
+        return MomentsResponse(video_id=video_uuid, moments=moments)
     
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error retrieving clips: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error retrieving clips")
+        logger.error(f"Error retrieving moments: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving moments")
 
 
-@app.get("/clips/{clip_id}/download")
-async def download_clip(
-    clip_id: str,
+@app.get("/videos/{video_id}/download")
+async def download_video(
+    video_id: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Download or stream a clip file.
+    Stream video for playback with Range request support.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        storage = get_storage_instance()
+        
+        if isinstance(storage, S3Storage):
+            # Stream from S3 through backend to avoid CORS issues
+            import httpx
+            
+            presigned_url = storage.get_video_path(video.storage_path)
+            
+            # Get Range header from request
+            range_header = request.headers.get("range")
+            
+            # Prepare headers for S3 request
+            headers = {}
+            if range_header:
+                headers["Range"] = range_header
+            
+            # Stream from S3
+            client = None
+            stream_ctx = None
+            try:
+                client = httpx.AsyncClient(timeout=300.0)
+                stream_ctx = client.stream("GET", presigned_url, headers=headers, follow_redirects=True)
+                response = await stream_ctx.__aenter__()
+                
+                if response.status_code == 404:
+                    await stream_ctx.__aexit__(None, None, None)
+                    await client.aclose()
+                    raise HTTPException(status_code=404, detail="Video file not found in storage")
+                
+                # Get content info
+                content_type = response.headers.get("content-type", "video/mp4")
+                content_length = response.headers.get("content-length")
+                content_range = response.headers.get("content-range")
+                
+                # Build response headers
+                response_headers = {
+                    "Accept-Ranges": "bytes",
+                    "Content-Type": content_type,
+                }
+                
+                if content_length:
+                    response_headers["Content-Length"] = content_length
+                if content_range:
+                    response_headers["Content-Range"] = content_range
+                
+                # Determine status code
+                status_code = 206 if range_header and response.status_code == 206 else 200
+                
+                # Generator to stream chunks
+                async def generate():
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            yield chunk
+                    except httpx.StreamClosed:
+                        pass
+                    finally:
+                        if stream_ctx:
+                            try:
+                                await stream_ctx.__aexit__(None, None, None)
+                            except Exception:
+                                pass
+                        if client:
+                            try:
+                                await client.aclose()
+                            except Exception:
+                                pass
+                
+                return StreamingResponse(
+                    generate(),
+                    status_code=status_code,
+                    headers=response_headers,
+                    media_type=content_type,
+                )
+            except HTTPException:
+                raise
+            except Exception as e:
+                if stream_ctx:
+                    try:
+                        await stream_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                if client:
+                    try:
+                        await client.aclose()
+                    except Exception:
+                        pass
+                logger.error(f"Error streaming video from S3: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Error accessing video file")
+        else:
+            # Local file - use FileResponse which handles Range requests
+            local_path = storage.get_video_path(video.storage_path)
+            if not os.path.exists(local_path):
+                raise HTTPException(status_code=404, detail="Video file not found on disk")
+            return FileResponse(
+                path=local_path,
+                media_type="video/mp4",
+                filename=f"video_{video_id}.mp4",
+            )
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading video: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error downloading video")
+
+
+@app.get("/moments/{moment_id}/download")
+async def download_moment(
+    moment_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Download or stream a moment file.
     
     Supports video playback (range requests) and download.
     For S3 storage, proxies the content to avoid CORS issues.
     For local storage, streams the file directly.
-    Returns 404 if clip not found or file doesn't exist.
+    Returns 404 if moment not found or file doesn't exist.
     """
     from fastapi.responses import StreamingResponse
     
     try:
-        clip_uuid = UUID(clip_id)
-        clip = await crud.get_clip_by_id(db, clip_uuid)
+        moment_uuid = UUID(moment_id)
+        moment = await crud.get_moment_by_id(db, moment_uuid)
         
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
+        if not moment:
+            raise HTTPException(status_code=404, detail="Moment not found")
         
         storage = get_storage_instance()
         
@@ -595,7 +746,7 @@ async def download_clip(
         if isinstance(storage, S3Storage):
             try:
                 import httpx
-                presigned_url = storage.get_video_path(clip.storage_path)
+                presigned_url = storage.get_video_path(moment.storage_path)
                 
                 # Get range header if present (for video seeking)
                 range_header = None
@@ -617,7 +768,7 @@ async def download_clip(
                     if response.status_code == 404:
                         await stream_ctx.__aexit__(None, None, None)
                         await client.aclose()
-                        raise HTTPException(status_code=404, detail="Clip file not found in storage")
+                        raise HTTPException(status_code=404, detail="Moment file not found in storage")
                     
                     # Determine content type
                     content_type = response.headers.get("content-type", "video/mp4")
@@ -630,7 +781,7 @@ async def download_clip(
                     response_headers = {
                         "Accept-Ranges": "bytes",
                         "Content-Type": content_type,
-                        "Content-Disposition": f'inline; filename="clip_{clip_id}.mp4"',
+                        "Content-Disposition": f'inline; filename="moment_{moment_id}.mp4"',
                     }
                     
                     if content_length:
@@ -681,82 +832,82 @@ async def download_clip(
                             pass
                     raise
             except httpx.HTTPError as e:
-                logger.error(f"Error fetching video from S3 for clip {clip_id}: {str(e)}", exc_info=True)
-                raise HTTPException(status_code=500, detail="Error accessing clip file")
+                logger.error(f"Error fetching video from S3 for moment {moment_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Error accessing moment file")
             except Exception as e:
-                logger.error(f"Error generating presigned URL for clip {clip_id}: {str(e)}", exc_info=True)
-                raise HTTPException(status_code=500, detail="Error accessing clip file")
+                logger.error(f"Error generating presigned URL for moment {moment_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Error accessing moment file")
         
         # Handle local storage
         upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-        clip_full_path = os.path.join(upload_dir, clip.storage_path)
+        moment_full_path = os.path.join(upload_dir, moment.storage_path)
         
-        if not os.path.exists(clip_full_path):
-            logger.error(f"Clip file not found at path: {clip_full_path}")
-            raise HTTPException(status_code=404, detail="Clip file not found")
+        if not os.path.exists(moment_full_path):
+            logger.error(f"Moment file not found at path: {moment_full_path}")
+            raise HTTPException(status_code=404, detail="Moment file not found")
         
         return FileResponse(
-            clip_full_path,
+            moment_full_path,
             media_type="video/mp4",
-            filename=f"clip_{clip_id}.mp4",
+            filename=f"moment_{moment_id}.mp4",
             headers={
                 "Accept-Ranges": "bytes",
-                "Content-Disposition": f'inline; filename="clip_{clip_id}.mp4"',
+                "Content-Disposition": f'inline; filename="moment_{moment_id}.mp4"',
             },
         )
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error downloading clip: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error downloading clip")
+        logger.error(f"Error downloading moment: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error downloading moment")
 
 
-@app.get("/clips/{clip_id}/thumbnail")
-async def get_clip_thumbnail(
-    clip_id: str,
+@app.get("/moments/{moment_id}/thumbnail")
+async def get_moment_thumbnail(
+    moment_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get thumbnail image for a clip.
+    Get thumbnail image for a moment.
     
     Returns the thumbnail image file.
     For S3 storage, redirects to presigned URL.
     For local storage, streams the file directly.
-    If thumbnail doesn't exist, generates it on-demand from the clip.
-    Returns 404 if clip not found.
+    If thumbnail doesn't exist, generates it on-demand from the moment.
+    Returns 404 if moment not found.
     """
     try:
-        clip_uuid = UUID(clip_id)
-        clip = await crud.get_clip_by_id(db, clip_uuid)
+        moment_uuid = UUID(moment_id)
+        moment = await crud.get_moment_by_id(db, moment_uuid)
         
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
+        if not moment:
+            raise HTTPException(status_code=404, detail="Moment not found")
         
         storage = get_storage_instance()
         
         # Generate thumbnail on-demand if it doesn't exist
-        if not clip.thumbnail_path:
+        if not moment.thumbnail_path:
             try:
-                logger.info(f"Generating thumbnail on-demand for clip {clip_id}")
+                logger.info(f"Generating thumbnail on-demand for moment {moment_id}")
                 
-                # Get clip file path
-                clip_file_path = storage.get_video_path(clip.storage_path)
+                # Get moment file path
+                moment_file_path = storage.get_video_path(moment.storage_path)
                 
-                # For S3 storage, clip_file_path is a presigned URL
+                # For S3 storage, moment_file_path is a presigned URL
                 # For local storage, it's a file path
-                thumbnail_path = await generate_thumbnail_async(clip_file_path, time_offset=0.0)
+                thumbnail_path = await generate_thumbnail_async(moment_file_path, time_offset=0.0)
                 
-                # Update clip with thumbnail path
-                clip.thumbnail_path = thumbnail_path
+                # Update moment with thumbnail path
+                moment.thumbnail_path = thumbnail_path
                 await db.commit()
-                await db.refresh(clip)
+                await db.refresh(moment)
                 
-                logger.info(f"Successfully generated thumbnail for clip {clip_id}: {thumbnail_path}")
+                logger.info(f"Successfully generated thumbnail for moment {moment_id}: {thumbnail_path}")
             except Exception as e:
-                logger.error(f"Failed to generate thumbnail on-demand for clip {clip_id}: {str(e)}", exc_info=True)
+                logger.error(f"Failed to generate thumbnail on-demand for moment {moment_id}: {str(e)}", exc_info=True)
                 raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
         
         # Handle S3 storage - proxy the thumbnail to avoid CORB issues
@@ -765,7 +916,7 @@ async def get_clip_thumbnail(
                 # Download thumbnail from S3 and stream it directly (same origin, no CORB)
                 import httpx
                 
-                presigned_url = storage.get_video_path(clip.thumbnail_path)
+                presigned_url = storage.get_video_path(moment.thumbnail_path)
                 
                 # Download from S3 presigned URL
                 async with httpx.AsyncClient(timeout=30.0) as client:
@@ -773,18 +924,18 @@ async def get_clip_thumbnail(
                     
                     # If thumbnail doesn't exist in S3 (404), generate it on-demand
                     if response.status_code == 404:
-                        logger.info(f"Thumbnail not found in S3 for clip {clip_id}, generating on-demand")
+                        logger.info(f"Thumbnail not found in S3 for moment {moment_id}, generating on-demand")
                         try:
-                            # Get clip file path
-                            clip_file_path = storage.get_video_path(clip.storage_path)
+                            # Get moment file path
+                            moment_file_path = storage.get_video_path(moment.storage_path)
                             # Generate thumbnail
-                            thumbnail_path = await generate_thumbnail_async(clip_file_path, time_offset=0.0)
-                            # Update clip with thumbnail path
-                            clip.thumbnail_path = thumbnail_path
+                            thumbnail_path = await generate_thumbnail_async(moment_file_path, time_offset=0.0)
+                            # Update moment with thumbnail path
+                            moment.thumbnail_path = thumbnail_path
                             await db.commit()
-                            await db.refresh(clip)
+                            await db.refresh(moment)
                             # Get new presigned URL for the generated thumbnail
-                            presigned_url = storage.get_video_path(clip.thumbnail_path)
+                            presigned_url = storage.get_video_path(moment.thumbnail_path)
                             # S3 eventual consistency - retry with small delays
                             import asyncio
                             max_retries = 3
@@ -797,7 +948,7 @@ async def get_clip_thumbnail(
                                 elif attempt == max_retries - 1:
                                     raise HTTPException(status_code=500, detail="Failed to fetch generated thumbnail after retries")
                         except Exception as gen_error:
-                            logger.error(f"Failed to generate thumbnail on-demand for clip {clip_id}: {str(gen_error)}", exc_info=True)
+                            logger.error(f"Failed to generate thumbnail on-demand for moment {moment_id}: {str(gen_error)}", exc_info=True)
                             raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
                     else:
                         response.raise_for_status()
@@ -810,21 +961,21 @@ async def get_clip_thumbnail(
                     media_type="image/jpeg",
                     headers={
                         "Cache-Control": "public, max-age=3600",
-                        "Content-Disposition": f'inline; filename="thumbnail_{clip_id}.jpg"',
+                        "Content-Disposition": f'inline; filename="thumbnail_{moment_id}.jpg"',
                     }
                 )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     # Thumbnail doesn't exist, try to generate it
-                    logger.info(f"Thumbnail not found in S3 for clip {clip_id}, generating on-demand")
+                    logger.info(f"Thumbnail not found in S3 for moment {moment_id}, generating on-demand")
                     try:
-                        clip_file_path = storage.get_video_path(clip.storage_path)
-                        thumbnail_path = await generate_thumbnail_async(clip_file_path, time_offset=0.0)
-                        clip.thumbnail_path = thumbnail_path
+                        moment_file_path = storage.get_video_path(moment.storage_path)
+                        thumbnail_path = await generate_thumbnail_async(moment_file_path, time_offset=0.0)
+                        moment.thumbnail_path = thumbnail_path
                         await db.commit()
-                        await db.refresh(clip)
+                        await db.refresh(moment)
                         # Retry fetching the newly generated thumbnail
-                        presigned_url = storage.get_video_path(clip.thumbnail_path)
+                        presigned_url = storage.get_video_path(moment.thumbnail_path)
                         async with httpx.AsyncClient(timeout=30.0) as client:
                             response = await client.get(presigned_url)
                             response.raise_for_status()
@@ -835,22 +986,22 @@ async def get_clip_thumbnail(
                             media_type="image/jpeg",
                             headers={
                                 "Cache-Control": "public, max-age=3600",
-                                "Content-Disposition": f'inline; filename="thumbnail_{clip_id}.jpg"',
+                                "Content-Disposition": f'inline; filename="thumbnail_{moment_id}.jpg"',
                             }
                         )
                     except Exception as gen_error:
-                        logger.error(f"Failed to generate thumbnail on-demand for clip {clip_id}: {str(gen_error)}", exc_info=True)
+                        logger.error(f"Failed to generate thumbnail on-demand for moment {moment_id}: {str(gen_error)}", exc_info=True)
                         raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
                 else:
-                    logger.error(f"Error proxying thumbnail from S3 for clip {clip_id}: {str(e)}", exc_info=True)
+                    logger.error(f"Error proxying thumbnail from S3 for moment {moment_id}: {str(e)}", exc_info=True)
                     raise HTTPException(status_code=500, detail="Error accessing thumbnail file")
             except Exception as e:
-                logger.error(f"Error proxying thumbnail from S3 for clip {clip_id}: {str(e)}", exc_info=True)
+                logger.error(f"Error proxying thumbnail from S3 for moment {moment_id}: {str(e)}", exc_info=True)
                 raise HTTPException(status_code=500, detail="Error accessing thumbnail file")
         
         # Handle local storage
         upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-        thumbnail_full_path = os.path.join(upload_dir, clip.thumbnail_path)
+        thumbnail_full_path = os.path.join(upload_dir, moment.thumbnail_path)
         
         if not os.path.exists(thumbnail_full_path):
             logger.error(f"Thumbnail file not found at path: {thumbnail_full_path}")
@@ -859,11 +1010,11 @@ async def get_clip_thumbnail(
         return FileResponse(
             thumbnail_full_path,
             media_type="image/jpeg",
-            filename=f"thumbnail_{clip_id}.jpg",
+            filename=f"thumbnail_{moment_id}.jpg",
         )
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
@@ -871,131 +1022,131 @@ async def get_clip_thumbnail(
         raise HTTPException(status_code=500, detail="Internal server error retrieving thumbnail")
 
 
-@app.get("/clips/{clip_id}", response_model=ClipDetailResponse)
-async def get_clip_detail(
-    clip_id: str,
+@app.get("/moments/{moment_id}", response_model=MomentDetailResponse)
+async def get_moment_detail(
+    moment_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get detailed clip information including parent video URL and duration.
+    Get detailed moment information including parent video URL and duration.
     
-    Returns clip metadata with parent video information needed for editing.
-    Returns 404 if clip not found.
+    Returns moment metadata with parent video information needed for editing.
+    Returns 404 if moment not found.
     """
     try:
-        clip_uuid = UUID(clip_id)
-        clip = await crud.get_clip_by_id(db, clip_uuid)
+        moment_uuid = UUID(moment_id)
+        moment = await crud.get_moment_by_id(db, moment_uuid)
         
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
+        if not moment:
+            raise HTTPException(status_code=404, detail="Moment not found")
         
-        video = await crud.get_video_by_id(db, clip.video_id)
+        video = await crud.get_video_by_id(db, moment.video_id)
         if not video:
             raise HTTPException(status_code=404, detail="Parent video not found")
         
-        video_url = await get_video_path(clip.video_id, db, download_local=False)
+        video_url = await get_video_path(moment.video_id, db, download_local=False)
         if not video_url:
             raise HTTPException(status_code=404, detail="Video file not found")
         
-        return ClipDetailResponse(
-            id=clip.id,
-            video_id=clip.video_id,
-            start=clip.start,
-            end=clip.end,
+        return MomentDetailResponse(
+            id=moment.id,
+            video_id=moment.video_id,
+            start=moment.start,
+            end=moment.end,
             video_url=video_url,
             video_duration=video.duration if video.duration else 0.0,
-            thumbnail_url=f"/clips/{clip.id}/thumbnail",
+            thumbnail_url=f"/moments/{moment.id}/thumbnail",
         )
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error retrieving clip detail: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error retrieving clip detail")
+        logger.error(f"Error retrieving moment detail: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving moment detail")
 
 
-@app.post("/clips/{clip_id}/feedback", status_code=201)
-async def submit_clip_feedback(
-    clip_id: str,
-    feedback: ClipFeedbackRequest,
+@app.post("/moments/{moment_id}/feedback", status_code=201)
+async def submit_moment_feedback(
+    moment_id: str,
+    feedback: MomentFeedbackRequest,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Submit feedback for a clip.
+    Submit feedback for a moment.
     
-    Finds the associated highlight and creates feedback with rating (0-100) and optional text.
-    Returns 404 if clip not found.
+    Finds the associated highlight and creates feedback with confidence score (0-100) and optional text.
+    Returns 404 if moment not found.
     """
     try:
-        clip_uuid = UUID(clip_id)
+        moment_uuid = UUID(moment_id)
         
-        # Get clip
-        clip = await crud.get_clip_by_id(db, clip_uuid)
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
+        # Get moment
+        moment = await crud.get_moment_by_id(db, moment_uuid)
+        if not moment:
+            raise HTTPException(status_code=404, detail="Moment not found")
         
         # Find associated highlight by matching start/end times
         highlight = await db.execute(
             select(HighlightDB).where(
-                HighlightDB.video_id == clip.video_id,
-                HighlightDB.start <= clip.start,
-                HighlightDB.end >= clip.end,
+                HighlightDB.video_id == moment.video_id,
+                HighlightDB.start <= moment.start,
+                HighlightDB.end >= moment.end,
             ).limit(1)
         )
         highlight_obj = highlight.scalar_one_or_none()
         
         if not highlight_obj:
-            raise HTTPException(status_code=404, detail="No associated highlight found for this clip")
+            raise HTTPException(status_code=404, detail="No associated highlight found for this moment")
         
-        # Create feedback with rating and text
+        # Create feedback with confidence score and text
         feedback_record = await crud.create_feedback(
             db,
             highlight_id=highlight_obj.id,
-            feedback_type=FeedbackType.RATING.value,
-            rating=feedback.rating,
+            feedback_type=FeedbackType.CONFIDENCE_SCORE.value,
+            confidence_score=feedback.confidence_score,
             text_feedback=feedback.text_feedback,
         )
         
-        logger.info(f"Clip feedback submitted for clip {clip_id}: rating={feedback.rating}")
+        logger.info(f"Moment feedback submitted for moment {moment_id}: confidence_score={feedback.confidence_score}")
         
         return {"id": str(feedback_record.id), "status": "created"}
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error submitting clip feedback: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error submitting clip feedback")
+        logger.error(f"Error submitting moment feedback: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error submitting moment feedback")
 
 
-@app.post("/clips/{clip_id}/save", status_code=201)
-async def save_clip(
-    clip_id: str,
+@app.post("/moments/{moment_id}/save", status_code=201)
+async def save_moment(
+    moment_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Save a clip for later.
+    Save a moment for later.
     
-    Creates a saved clip record. Returns existing record if clip is already saved.
-    Returns 404 if clip not found.
+    Creates a saved moment record. Returns existing record if moment is already saved.
+    Returns 404 if moment not found.
     """
     try:
-        clip_uuid = UUID(clip_id)
+        moment_uuid = UUID(moment_id)
         
-        # Get clip
-        clip = await crud.get_clip_by_id(db, clip_uuid)
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
+        # Get moment
+        moment = await crud.get_moment_by_id(db, moment_uuid)
+        if not moment:
+            raise HTTPException(status_code=404, detail="Moment not found")
         
         # Check if already saved
-        existing_saved = await crud.get_saved_clip(db, clip_uuid)
+        existing_saved = await crud.get_saved_moment(db, moment_uuid)
         if existing_saved:
-            return SavedClipResponse(
+            return SavedMomentResponse(
                 id=existing_saved.id,
-                clip_id=existing_saved.clip_id,
+                moment_id=existing_saved.moment_id,
                 highlight_id=existing_saved.highlight_id,
                 created_at=existing_saved.created_at,
             )
@@ -1003,58 +1154,58 @@ async def save_clip(
         # Find associated highlight
         highlight = await db.execute(
             select(HighlightDB).where(
-                HighlightDB.video_id == clip.video_id,
-                HighlightDB.start <= clip.start,
-                HighlightDB.end >= clip.end,
+                HighlightDB.video_id == moment.video_id,
+                HighlightDB.start <= moment.start,
+                HighlightDB.end >= moment.end,
             ).limit(1)
         )
         highlight_obj = highlight.scalar_one_or_none()
         
-        # Create saved clip record
-        saved_clip = await crud.create_saved_clip(
+        # Create saved moment record
+        saved_moment = await crud.create_saved_moment(
             db,
-            clip_id=clip_uuid,
+            moment_id=moment_uuid,
             highlight_id=highlight_obj.id if highlight_obj else None,
         )
         
-        logger.info(f"Clip saved: {clip_id}")
+        logger.info(f"Moment saved: {moment_id}")
         
-        return SavedClipResponse(
-            id=saved_clip.id,
-            clip_id=saved_clip.clip_id,
-            highlight_id=saved_clip.highlight_id,
-            created_at=saved_clip.created_at,
+        return SavedMomentResponse(
+            id=saved_moment.id,
+            moment_id=saved_moment.moment_id,
+            highlight_id=saved_moment.highlight_id,
+            created_at=saved_moment.created_at,
         )
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error saving clip: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error saving clip")
+        logger.error(f"Error saving moment: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error saving moment")
 
 
-@app.post("/clips/{clip_id}/edit", response_model=ClipResponse)
-async def edit_clip(
-    clip_id: str,
-    edit_request: EditClipRequest,
+@app.post("/moments/{moment_id}/edit", response_model=MomentResponse)
+async def edit_moment(
+    moment_id: str,
+    edit_request: EditMomentRequest,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Edit a clip by updating its start and end timestamps.
+    Edit a moment by updating its start and end timestamps.
     
-    Re-cuts the clip using FFmpeg, updates the database record, and deletes the old clip file.
-    Returns 404 if clip not found, 400 if timestamps are invalid.
+    Re-cuts the moment using FFmpeg, updates the database record, and deletes the old moment file.
+    Returns 404 if moment not found, 400 if timestamps are invalid.
     """
     try:
-        clip_uuid = UUID(clip_id)
-        clip = await crud.get_clip_by_id(db, clip_uuid)
+        moment_uuid = UUID(moment_id)
+        moment = await crud.get_moment_by_id(db, moment_uuid)
         
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
+        if not moment:
+            raise HTTPException(status_code=404, detail="Moment not found")
         
-        video = await crud.get_video_by_id(db, clip.video_id)
+        video = await crud.get_video_by_id(db, moment.video_id)
         if not video:
             raise HTTPException(status_code=404, detail="Parent video not found")
         
@@ -1073,215 +1224,215 @@ async def edit_clip(
                 detail=f"End time ({new_end}) exceeds video duration ({video.duration})"
             )
         
-        old_storage_path = clip.storage_path
-        old_thumbnail_path = clip.thumbnail_path
+        old_storage_path = moment.storage_path
+        old_thumbnail_path = moment.thumbnail_path
         
-        video_path = await get_video_path(clip.video_id, db, download_local=False)
+        video_path = await get_video_path(moment.video_id, db, download_local=False)
         if not video_path:
             raise HTTPException(status_code=404, detail="Video file not found")
         
-        storage_path, temp_clip_path = await generate_clip_async(video_path, new_start, new_end)
+        storage_path, temp_moment_path = await generate_moment_async(video_path, new_start, new_end)
         
         thumbnail_path = None
         try:
-            if temp_clip_path and os.path.exists(temp_clip_path):
-                thumbnail_path = await generate_thumbnail_async(temp_clip_path, time_offset=0.0)
+            if temp_moment_path and os.path.exists(temp_moment_path):
+                thumbnail_path = await generate_thumbnail_async(temp_moment_path, time_offset=0.0)
             else:
                 upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-                clip_full_path = os.path.join(upload_dir, storage_path)
-                if os.path.exists(clip_full_path):
-                    thumbnail_path = await generate_thumbnail_async(clip_full_path, time_offset=0.0)
+                moment_full_path = os.path.join(upload_dir, storage_path)
+                if os.path.exists(moment_full_path):
+                    thumbnail_path = await generate_thumbnail_async(moment_full_path, time_offset=0.0)
         except Exception as e:
-            logger.warning(f"Failed to generate thumbnail for edited clip {clip_id}: {str(e)}", exc_info=True)
+            logger.warning(f"Failed to generate thumbnail for edited moment {moment_id}: {str(e)}", exc_info=True)
         
-        updated_clip = await crud.update_clip(
+        updated_moment = await crud.update_moment(
             db,
-            clip_uuid,
+            moment_uuid,
             start=new_start,
             end=new_end,
             storage_path=storage_path,
             thumbnail_path=thumbnail_path,
         )
         
-        if not updated_clip:
-            raise HTTPException(status_code=500, detail="Failed to update clip in database")
+        if not updated_moment:
+            raise HTTPException(status_code=500, detail="Failed to update moment in database")
         
         try:
-            await delete_clip_file(old_storage_path, old_thumbnail_path)
+            await delete_moment_file(old_storage_path, old_thumbnail_path)
         except Exception as e:
-            logger.warning(f"Failed to delete old clip file: {str(e)}", exc_info=True)
+            logger.warning(f"Failed to delete old moment file: {str(e)}", exc_info=True)
         
-        if temp_clip_path and os.path.exists(temp_clip_path):
+        if temp_moment_path and os.path.exists(temp_moment_path):
             try:
-                os.remove(temp_clip_path)
+                os.remove(temp_moment_path)
             except Exception as e:
-                logger.warning(f"Failed to clean up temp clip file: {str(e)}")
+                logger.warning(f"Failed to clean up temp moment file: {str(e)}")
         
-        logger.info(f"Successfully edited clip {clip_id}: {new_start:.2f}s - {new_end:.2f}s")
+        logger.info(f"Successfully edited moment {moment_id}: {new_start:.2f}s - {new_end:.2f}s")
         
-        return ClipResponse(
-            id=updated_clip.id,
-            clip_url=f"/clips/{updated_clip.id}/download",
-            start=updated_clip.start,
-            end=updated_clip.end,
-            thumbnail_url=f"/clips/{updated_clip.id}/thumbnail",
+        return MomentResponse(
+            id=updated_moment.id,
+            moment_url=f"/moments/{updated_moment.id}/download",
+            start=updated_moment.start,
+            end=updated_moment.end,
+            thumbnail_url=f"/moments/{updated_moment.id}/thumbnail",
         )
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error editing clip: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error editing clip")
+        logger.error(f"Error editing moment: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error editing moment")
 
 
-@app.delete("/clips/{clip_id}/save")
-async def unsave_clip(
-    clip_id: str,
+@app.delete("/moments/{moment_id}/save")
+async def unsave_moment(
+    moment_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Remove a clip from saved clips.
+    Remove a moment from saved moments.
     
-    Returns 404 if clip is not currently saved.
+    Returns 404 if moment is not currently saved.
     """
     try:
-        clip_uuid = UUID(clip_id)
+        moment_uuid = UUID(moment_id)
         
-        deleted = await crud.delete_saved_clip(db, clip_uuid)
+        deleted = await crud.delete_saved_moment(db, moment_uuid)
         if not deleted:
-            raise HTTPException(status_code=404, detail="Clip is not saved")
+            raise HTTPException(status_code=404, detail="Moment is not saved")
         
-        logger.info(f"Clip unsaved: {clip_id}")
+        logger.info(f"Moment unsaved: {moment_id}")
         
         return {"status": "deleted"}
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error unsaving clip: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error unsaving clip")
+        logger.error(f"Error unsaving moment: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error unsaving moment")
 
 
-@app.get("/clips", response_model=ClipsResponse)
-async def get_all_clips(
+@app.get("/moments", response_model=MomentsResponse)
+async def get_all_moments(
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get all clips from all videos.
+    Get all moments from all videos.
     
-    Returns list of clips with pagination support.
+    Returns list of moments with pagination support.
     """
     try:
-        clips_db = await crud.get_all_clips(db, limit=limit, offset=offset)
+        moments_db = await crud.get_all_moments(db, limit=limit, offset=offset)
         
-        clips = [
-            ClipResponse(
-                id=clip.id,
-                clip_url=f"/clips/{clip.id}/download",
-                start=clip.start,
-                end=clip.end,
-                thumbnail_url=f"/clips/{clip.id}/thumbnail",
+        moments = [
+            MomentResponse(
+                id=moment.id,
+                moment_url=f"/moments/{moment.id}/download",
+                start=moment.start,
+                end=moment.end,
+                thumbnail_url=f"/moments/{moment.id}/thumbnail",
             )
-            for clip in clips_db
+            for moment in moments_db
         ]
         
-        # Use a dummy video_id for all clips endpoint
-        return ClipsResponse(video_id=UUID("00000000-0000-0000-0000-000000000000"), clips=clips)
+        # Use a dummy video_id for all moments endpoint
+        return MomentsResponse(video_id=UUID("00000000-0000-0000-0000-000000000000"), moments=moments)
     
     except Exception as e:
-        logger.error(f"Error retrieving all clips: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error retrieving clips")
+        logger.error(f"Error retrieving all moments: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving moments")
 
 
-@app.get("/clips/saved", response_model=List[ClipResponse])
-async def get_saved_clips(
+@app.get("/moments/saved", response_model=List[MomentResponse])
+async def get_saved_moments(
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get all saved clips.
+    Get all saved moments.
     
-    Returns list of saved clips with their clip details.
+    Returns list of saved moments with their moment details.
     """
     try:
-        saved_clips_db = await crud.get_all_saved_clips(db, limit=limit, offset=offset)
+        saved_moments_db = await crud.get_all_saved_moments(db, limit=limit, offset=offset)
         
-        clips = []
-        for saved_clip in saved_clips_db:
-            clip = await crud.get_clip_by_id(db, saved_clip.clip_id)
-            if clip:
-                clips.append(
-                    ClipResponse(
-                        id=clip.id,
-                        clip_url=f"/clips/{clip.id}/download",
-                        start=clip.start,
-                        end=clip.end,
-                        thumbnail_url=f"/clips/{clip.id}/thumbnail",
+        moments = []
+        for saved_moment in saved_moments_db:
+            moment = await crud.get_moment_by_id(db, saved_moment.moment_id)
+            if moment:
+                moments.append(
+                    MomentResponse(
+                        id=moment.id,
+                        moment_url=f"/moments/{moment.id}/download",
+                        start=moment.start,
+                        end=moment.end,
+                        thumbnail_url=f"/moments/{moment.id}/thumbnail",
                     )
                 )
         
-        return clips
+        return moments
     
     except Exception as e:
-        logger.error(f"Error retrieving saved clips: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error retrieving saved clips")
+        logger.error(f"Error retrieving saved moments: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving saved moments")
 
 
-@app.delete("/clips")
-async def delete_all_clips_endpoint(
+@app.delete("/moments")
+async def delete_all_moments_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Delete all clips from the database and storage.
+    Delete all moments from the database and storage.
     
-    This will also delete associated saved clips and feedback due to CASCADE.
+    This will also delete associated saved moments and feedback due to CASCADE.
     """
     try:
-        # Get all clips before deletion to clean up storage files
-        result = await db.execute(select(Clip))
-        clips = list(result.scalars().all())
+        # Get all moments before deletion to clean up storage files
+        result = await db.execute(select(Moment))
+        moments = list(result.scalars().all())
         
         storage = get_storage_instance()
         
         # Delete files from storage
-        for clip in clips:
+        for moment in moments:
             try:
                 if isinstance(storage, S3Storage):
-                    # Delete clip file
-                    storage.delete_video(clip.storage_path)
+                    # Delete moment file
+                    storage.delete_video(moment.storage_path)
                     # Delete thumbnail if exists
-                    if clip.thumbnail_path:
-                        storage.delete_video(clip.thumbnail_path)
+                    if moment.thumbnail_path:
+                        storage.delete_video(moment.thumbnail_path)
                 else:
                     # Local storage - delete files
                     upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-                    clip_path = os.path.join(upload_dir, clip.storage_path)
-                    if os.path.exists(clip_path):
-                        os.remove(clip_path)
-                    if clip.thumbnail_path:
-                        thumbnail_path = os.path.join(upload_dir, clip.thumbnail_path)
+                    moment_path = os.path.join(upload_dir, moment.storage_path)
+                    if os.path.exists(moment_path):
+                        os.remove(moment_path)
+                    if moment.thumbnail_path:
+                        thumbnail_path = os.path.join(upload_dir, moment.thumbnail_path)
                         if os.path.exists(thumbnail_path):
                             os.remove(thumbnail_path)
             except Exception as e:
-                logger.warning(f"Failed to delete storage file for clip {clip.id}: {str(e)}")
+                logger.warning(f"Failed to delete storage file for moment {moment.id}: {str(e)}")
         
-        # Delete all clips from database
-        deleted_count = await crud.delete_all_clips(db)
+        # Delete all moments from database
+        deleted_count = await crud.delete_all_moments(db)
         
-        logger.info(f"Deleted {deleted_count} clips")
+        logger.info(f"Deleted {deleted_count} moments")
         
         return {"status": "deleted", "count": deleted_count}
     
     except Exception as e:
-        logger.error(f"Error deleting all clips: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error deleting clips")
+        logger.error(f"Error deleting all moments: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error deleting moments")
 
 
 @app.post("/highlights/{highlight_id}/feedback", status_code=201)
@@ -1293,7 +1444,7 @@ async def submit_feedback(
     """
     Submit feedback for a highlight.
     
-    Accepts explicit feedback (positive, negative, rating) for a highlight.
+    Accepts explicit feedback (positive, negative, confidence_score) for a highlight.
     Returns 404 if highlight not found.
     """
     try:
@@ -1305,14 +1456,14 @@ async def submit_feedback(
         if not highlight_obj:
             raise HTTPException(status_code=404, detail="Highlight not found")
         
-        if feedback.feedback_type == FeedbackType.RATING.value and feedback.rating is None:
-            raise HTTPException(status_code=400, detail="Rating is required for rating feedback type")
+        if feedback.feedback_type == FeedbackType.CONFIDENCE_SCORE.value and feedback.confidence_score is None:
+            raise HTTPException(status_code=400, detail="Confidence score is required for confidence_score feedback type")
         
         feedback_record = await crud.create_feedback(
             db,
             highlight_id=highlight_uuid,
             feedback_type=feedback.feedback_type.value,
-            rating=feedback.rating,
+            confidence_score=feedback.confidence_score,
             text_feedback=feedback.text_feedback,
         )
         
@@ -1352,7 +1503,7 @@ async def track_highlight_view(
             db,
             highlight_id=highlight_uuid,
             feedback_type=FeedbackType.VIEW.value,
-            rating=None,
+            confidence_score=None,
         )
         
         return {"id": str(feedback_record.id), "status": "created"}
@@ -1389,7 +1540,7 @@ async def track_highlight_skip(
             db,
             highlight_id=highlight_uuid,
             feedback_type=FeedbackType.SKIP.value,
-            rating=None,
+            confidence_score=None,
         )
         
         return {"id": str(feedback_record.id), "status": "created"}
@@ -1403,28 +1554,28 @@ async def track_highlight_skip(
         raise HTTPException(status_code=500, detail="Internal server error tracking skip")
 
 
-@app.post("/clips/{clip_id}/view", status_code=201)
-async def track_clip_view(
-    clip_id: str,
+@app.post("/moments/{moment_id}/view", status_code=201)
+async def track_moment_view(
+    moment_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Track that a user viewed a clip (implicit positive feedback for associated highlight).
+    Track that a user viewed a moment (implicit positive feedback for associated highlight).
     
-    Returns 404 if clip not found.
+    Returns 404 if moment not found.
     """
     try:
-        clip_uuid = UUID(clip_id)
-        clip = await crud.get_clip_by_id(db, clip_uuid)
+        moment_uuid = UUID(moment_id)
+        moment = await crud.get_moment_by_id(db, moment_uuid)
         
-        if not clip:
-            raise HTTPException(status_code=404, detail="Clip not found")
+        if not moment:
+            raise HTTPException(status_code=404, detail="Moment not found")
         
         highlight = await db.execute(
             select(HighlightDB).where(
-                HighlightDB.video_id == clip.video_id,
-                HighlightDB.start <= clip.start,
-                HighlightDB.end >= clip.end,
+                HighlightDB.video_id == moment.video_id,
+                HighlightDB.start <= moment.start,
+                HighlightDB.end >= moment.end,
             ).limit(1)
         )
         highlight_obj = highlight.scalar_one_or_none()
@@ -1441,12 +1592,12 @@ async def track_clip_view(
             return {"status": "created", "note": "No associated highlight found"}
     
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid clip ID format")
+        raise HTTPException(status_code=400, detail="Invalid moment ID format")
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error tracking clip view: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error tracking clip view")
+        logger.error(f"Error tracking moment view: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error tracking moment view")
 
 
 @app.get("/highlights/{highlight_id}/analytics", response_model=FeedbackAnalyticsResponse)
@@ -1670,39 +1821,42 @@ async def get_projects(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get all projects (videos that have clips).
+    Get all projects (videos that have moments).
     
-    Returns list of projects with video_id, created_at, duration, and clip_count.
+    Returns list of projects with video_id, created_at, duration, and moment_count.
     """
     try:
-        videos = await crud.get_videos_with_clips(db)
+        logger.info("[Backend] /projects endpoint called - fetching videos with moments")
+        videos = await crud.get_videos_with_moments(db)
+        logger.info(f"[Backend] Found {len(videos)} videos with moments")
         
         projects = [
             ProjectResponse(
                 video_id=video.id,
                 created_at=video.created_at,
                 duration=video.duration,
-                clip_count=len(video.clips),
+                moment_count=len(video.moments),
             )
             for video in videos
         ]
         
+        logger.info(f"[Backend] Returning {len(projects)} projects: {[str(p.video_id) for p in projects]}")
         return ProjectsResponse(projects=projects)
     
     except Exception as e:
-        logger.error(f"Error retrieving projects: {str(e)}", exc_info=True)
+        logger.error(f"[Backend] Error retrieving projects: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error retrieving projects")
 
 
-@app.get("/projects/{video_id}", response_model=ClipsResponse)
+@app.get("/projects/{video_id}", response_model=MomentsResponse)
 async def get_project(
     video_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get a project by video_id (returns all clips for that video).
+    Get a video by video_id (returns all moments for that video).
     
-    This is essentially the same as /videos/{video_id}/clips but with a projects endpoint.
+    This is essentially the same as /videos/{video_id}/moments but with a projects endpoint.
     """
     try:
         video_uuid = UUID(video_id)
@@ -1711,20 +1865,20 @@ async def get_project(
         if not video:
             raise HTTPException(status_code=404, detail="Project not found")
         
-        clips_db = await crud.get_clips_by_video_id(db, video_uuid)
+        moments_db = await crud.get_moments_by_video_id(db, video_uuid)
         
-        clips = [
-            ClipResponse(
-                id=clip.id,
-                clip_url=f"/clips/{clip.id}/download",
-                start=clip.start,
-                end=clip.end,
-                thumbnail_url=f"/clips/{clip.id}/thumbnail",
+        moments = [
+            MomentResponse(
+                id=moment.id,
+                moment_url=f"/moments/{moment.id}/download",
+                start=moment.start,
+                end=moment.end,
+                thumbnail_url=f"/moments/{moment.id}/thumbnail",
             )
-            for clip in clips_db
+            for moment in moments_db
         ]
         
-        return ClipsResponse(video_id=video_uuid, clips=clips)
+        return MomentsResponse(video_id=video_uuid, moments=moments)
     
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid video ID format")

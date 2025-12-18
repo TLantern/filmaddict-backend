@@ -132,6 +132,10 @@ try:
     # Get Redis URL from environment
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     
+    # Validate Redis URL format
+    if not redis_url or not (redis_url.startswith("redis://") or redis_url.startswith("rediss://")):
+        raise ValueError(f"Invalid REDIS_URL: {redis_url}. Must start with redis:// or rediss://")
+    
     # Parse Redis URL and create connection
     # Handle both redis:// and rediss:// (SSL) URLs
     if redis_url.startswith("rediss://"):
@@ -148,9 +152,9 @@ try:
     # Create RQ queue for video processing
     video_processing_queue = Queue("video_processing", connection=redis_conn)
     
-except ImportError:
-    # RQ not available, set to None
+except (ImportError, ValueError, Exception) as e:
+    # RQ not available or Redis misconfigured, set to None
     redis_conn = None
     video_processing_queue = None
-    logger.warning("RQ not available - worker.py will not work without rq and redis packages")
+    logger.warning(f"Redis/RQ not available: {str(e)}. Using async workers instead.")
 
