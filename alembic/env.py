@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
 from database import Base
-from db.models import Video, Transcript, Highlight, Moment, HighlightFeedback, PromptVersion, SavedMoment, CalibrationConfig
+from db.models import Video, Transcript, Highlight, Moment, HighlightFeedback, PromptVersion, SavedMoment, CalibrationConfig, User
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -39,8 +39,9 @@ def get_url():
     parsed = urlparse(database_url)
     query_params = parse_qs(parsed.query)
     
-    # Remove sslmode from query params
+    # Remove sslmode and channel_binding from query params (asyncpg doesn't support channel_binding)
     query_params.pop("sslmode", None)
+    query_params.pop("channel_binding", None)
     
     # Reconstruct URL without sslmode
     new_query = urlencode(query_params, doseq=True)
@@ -98,8 +99,9 @@ async def run_async_migrations() -> None:
     parsed = urlparse(database_url)
     query_params = parse_qs(parsed.query)
     
-    # Remove sslmode from query params and configure SSL for asyncpg
+    # Remove sslmode and channel_binding from query params and configure SSL for asyncpg
     ssl_mode = query_params.pop("sslmode", None)
+    query_params.pop("channel_binding", None)  # Remove channel_binding as asyncpg doesn't support it
     connect_args = {}
     if ssl_mode and ssl_mode[0] == "require":
         # Create SSL context that doesn't verify certificates (for Neon/cloud databases)

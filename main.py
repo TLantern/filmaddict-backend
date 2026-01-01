@@ -5,15 +5,18 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
+# Disable tokenizers parallelism to avoid deadlocks when forking
+os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request, Header, BackgroundTasks
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, Base, get_db, async_session_maker
-from db.models import Video, Transcript, Highlight as HighlightDB, Moment
+from db.models import Video, Transcript, Highlight as HighlightDB, Moment, Timeline
 from db import crud
 from sqlalchemy import select
 from models import (
@@ -25,25 +28,26 @@ from models import (
     MomentResponse,
     MomentsResponse,
     Highlight,
-    HighlightFeedbackRequest,
-    FeedbackAnalyticsResponse,
-    FeedbackType,
     PromptVersionResponse,
     PromptVersionRequest,
     CalibrationConfigResponse,
-    MomentFeedbackRequest,
     SavedMomentResponse,
     EditMomentRequest,
     MomentDetailResponse,
     ProjectResponse,
     ProjectsResponse,
+    SegmentsResponse,
+    SegmentAnalysis,
+    CutVideoRequest,
+    SegmentFeedbackRequest,
+    SegmentFeedbackResponse,
 )
 from typing import List, Optional
 from datetime import datetime
 from utils.storage import store_video, get_storage_instance, S3Storage, get_video_path
 from utils.youtube import download_youtube_video, validate_youtube_url
 from utils.jobs import enqueue_video_processing, start_worker, stop_worker, start_learning_worker, stop_learning_worker
-from utils.moments import generate_moment_async, generate_thumbnail_async, delete_moment_file
+from utils.moments import generate_moment_async, generate_thumbnail_async, generate_video_thumbnail_async, delete_moment_file
 from utils.learning_logger import (
     get_learning_log,
     get_changes_by_type,
@@ -59,6 +63,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def get_clerk_user_id(x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id")) -> Optional[str]:
+    """Extract Clerk user ID from request headers."""
+    return x_clerk_user_id
 
 
 @asynccontextmanager
@@ -101,13 +110,25 @@ Example format:
             logger.info("Created default prompt version v1")
     
     # Start background workers
-    await start_worker()
-    await start_learning_worker()
+    logger.info("🚀 Starting background workers...")
+    try:
+        await start_worker()
+        logger.info("✅ Video processing worker started")
+    except Exception as e:
+        logger.error(f"❌ Failed to start video processing worker: {e}", exc_info=True)
+        raise
+    
+    # Learning pipeline disabled
+    # try:
+    #     await start_learning_worker()
+    #     logger.info("✅ Learning worker started")
+    # except Exception as e:
+    #     logger.warning(f"⚠️  Failed to start learning worker (non-critical): {e}", exc_info=True)
     
     yield
     
     # Stop background workers
-    await stop_learning_worker()
+    # await stop_learning_worker()  # Learning pipeline disabled
     await stop_worker()
     logger.info("Shutting down FilmAddict Backend")
     await engine.dispose()
@@ -155,7 +176,32 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok"}
+    """Health check endpoint that also reports worker status."""
+    from utils.jobs import _worker_task, _video_processing_queue
+    
+    worker_status = "running"
+    queue_size = 0
+    
+    if _worker_task is None:
+        worker_status = "not_started"
+    elif _worker_task.done():
+        worker_status = "stopped"
+        if _worker_task.exception():
+            worker_status = f"crashed: {str(_worker_task.exception())}"
+    
+    if _video_processing_queue is not None:
+        queue_size = _video_processing_queue.qsize()
+    
+    # Test Redis connection
+    from utils.redis_cache import test_redis_connection
+    redis_status = test_redis_connection()
+    
+    return {
+        "status": "ok",
+        "worker_status": worker_status,
+        "queue_size": queue_size,
+        "redis": redis_status,
+    }
 
 
 @app.get("/version")
@@ -239,11 +285,17 @@ class YouTubeRequest(BaseModel):
     aspect_ratio: Optional[str] = Field("16:9", description="Aspect ratio for generated clips (9:16, 16:9, 1:1, 4:5, original)")
 
 
+class ExportVideoRequest(BaseModel):
+    format: str = Field(..., description="Export format: mp4, mov_prores422, mov_prores4444, webm, xml, edl, aaf")
+    segments_to_remove: Optional[List[dict]] = Field(None, description="Optional list of {start_time, end_time} segments to remove")
+
+
 @app.post("/videos/upload", status_code=201)
 async def upload_video(
     file: UploadFile = File(...),
     aspect_ratio: Optional[str] = Form("16:9"),
     db: AsyncSession = Depends(get_db),
+    clerk_user_id: Optional[str] = Depends(get_clerk_user_id),
 ):
     """
     Upload a video file.
@@ -286,12 +338,25 @@ async def upload_video(
         # Store video file
         storage_path = await store_video(file)
         
+        # Generate thumbnail from video
+        thumbnail_path = None
+        try:
+            storage = get_storage_instance()
+            video_file_path = storage.get_video_path(storage_path)
+            thumbnail_path = await generate_video_thumbnail_async(video_file_path, time_offset=1.0)
+            logger.info(f"Generated thumbnail for video: {thumbnail_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate thumbnail for video: {str(e)}")
+            # Continue without thumbnail - not critical
+        
         # Create video record in database
         video = await crud.create_video(
             db=db,
             storage_path=storage_path,
             status=VideoStatus.UPLOADED,
             aspect_ratio=aspect_ratio,
+            clerk_user_id=clerk_user_id,
+            thumbnail_path=thumbnail_path,
         )
         
         # Enqueue background job to process the video
@@ -299,6 +364,13 @@ async def upload_video(
         
         # Update status to QUEUED
         video = await crud.update_video_status(db, video.id, VideoStatus.QUEUED)
+        
+        # Create timeline for this video
+        await crud.create_or_update_timeline(
+            db=db,
+            video_id=video.id,
+            clerk_user_id=clerk_user_id,
+        )
         
         logger.info(f"Video uploaded successfully and queued for processing: {video.id}")
         
@@ -319,6 +391,7 @@ async def upload_video(
 async def upload_youtube_video(
     request: YouTubeRequest,
     db: AsyncSession = Depends(get_db),
+    clerk_user_id: Optional[str] = Depends(get_clerk_user_id),
 ):
     """
     Download and store a YouTube video.
@@ -388,6 +461,17 @@ async def upload_youtube_video(
         if aspect_ratio and aspect_ratio not in valid_ratios:
             aspect_ratio = "16:9"
         
+        # Generate thumbnail from video
+        thumbnail_path = None
+        try:
+            storage = get_storage_instance()
+            video_file_path = storage.get_video_path(storage_path)
+            thumbnail_path = await generate_video_thumbnail_async(video_file_path, time_offset=1.0)
+            logger.info(f"Generated thumbnail for YouTube video: {thumbnail_path}")
+        except Exception as e:
+            logger.warning(f"Failed to generate thumbnail for YouTube video: {str(e)}")
+            # Continue without thumbnail - not critical
+        
         # Create video record in database
         video = await crud.create_video(
             db=db,
@@ -395,6 +479,8 @@ async def upload_youtube_video(
             duration=duration,
             status=VideoStatus.UPLOADED,
             aspect_ratio=aspect_ratio,
+            clerk_user_id=clerk_user_id,
+            thumbnail_path=thumbnail_path,
         )
         
         # Enqueue background job to process the video
@@ -402,6 +488,13 @@ async def upload_youtube_video(
         
         # Update status to QUEUED
         video = await crud.update_video_status(db, video.id, VideoStatus.QUEUED)
+        
+        # Create timeline for this video
+        await crud.create_or_update_timeline(
+            db=db,
+            video_id=video.id,
+            clerk_user_id=clerk_user_id,
+        )
         
         logger.info(f"YouTube video processed successfully and queued for processing: {video.id}")
         
@@ -480,10 +573,17 @@ async def get_video_status(
             logger.warning(f"[Backend] Video {video_id} not found")
             raise HTTPException(status_code=404, detail="Video not found")
         
-        # Get moment count for logging
-        moments_db = await crud.get_moments_by_video_id(db, video_uuid)
-        moments_count = len(moments_db)
-        logger.info(f"[Backend] Video {video_id} status: {video.status}, duration: {video.duration}, moments: {moments_count}")
+        # Get segment counts using optimized aggregation query (much faster than loading all segments)
+        segment_counts = await crud.get_segment_counts_by_label(db, video_uuid)
+        segments_count = sum(segment_counts.values())
+        
+        # Extract counts by label (default to 0 if label not present)
+        fluff_count = segment_counts.get("FLUFF", 0)
+        
+        logger.info(
+            f"[Backend] Video {video_id} status: {video.status}, duration: {video.duration}, "
+            f"segments: {segments_count} (FLUFF: {fluff_count})"
+        )
         
         return VideoStatusResponse(
             video_id=video.id,
@@ -497,8 +597,55 @@ async def get_video_status(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error retrieving video status: {str(e)}", exc_info=True)
+        error_msg = str(e)
+        if "Authentication timed out" in error_msg or "ProtocolViolationError" in error_msg:
+            logger.error(f"Database connection timeout: {error_msg}", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail="Database connection timeout. Please try again in a moment."
+            )
+        logger.error(f"Error retrieving video status: {error_msg}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error retrieving video status")
+
+
+@app.post("/videos/{video_id}/reprocess", status_code=200)
+async def reprocess_video(
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Manually trigger reprocessing of a video.
+    Useful if processing failed or segments weren't saved.
+    """
+    try:
+        from utils.jobs import enqueue_video_processing
+        from models import VideoStatus
+        
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Reset status and enqueue for processing
+        await crud.update_video_status(db, video_uuid, VideoStatus.QUEUED)
+        await enqueue_video_processing(video_uuid)
+        
+        logger.info(f"Manually triggered reprocessing for video: {video_id}")
+        
+        return {
+            "status": "success",
+            "video_id": str(video_uuid),
+            "message": "Video queued for reprocessing",
+        }
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error reprocessing video: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @app.get("/videos/{video_id}/highlights", response_model=HighlightsResponse)
@@ -524,16 +671,51 @@ async def get_highlights(
         highlights_db = await crud.get_highlights_by_video_id(db, video_uuid)
         logger.info(f"[Backend] /videos/{video_id}/highlights - Found {len(highlights_db)} highlights")
         
-        highlights = [
-            Highlight(
+        # Get transcript to extract text for each highlight
+        transcript = await crud.get_transcript_by_video_id(db, video_uuid)
+        transcript_segments = []
+        if transcript and transcript.segments:
+            transcript_segments = [TranscriptSegment(**seg) for seg in transcript.segments]
+        
+        # Generate explanations for highlights using LLM
+        from utils.explanation_builder import build_highlight_explanation_from_text_async
+        highlights = []
+        for h in highlights_db:
+            explanation = None
+            try:
+                # Extract text for this highlight segment
+                highlight_text = ""
+                if transcript_segments:
+                    segment_texts = [
+                        seg.text for seg in transcript_segments
+                        if seg.start >= h.start - 0.5 and seg.end <= h.end + 0.5
+                    ]
+                    highlight_text = " ".join(segment_texts)
+                
+                # If no text found, use title as fallback
+                if not highlight_text and h.title:
+                    highlight_text = h.title
+                
+                if highlight_text:
+                    explanation = await build_highlight_explanation_from_text_async(
+                        text=highlight_text,
+                        score=h.score,
+                    )
+                    logger.debug(f"[Backend] Generated explanation for highlight [{h.start:.1f}s-{h.end:.1f}s]: {explanation.confidence} confidence")
+                else:
+                    logger.warning(f"[Backend] No transcript text found for highlight [{h.start:.1f}s-{h.end:.1f}s]")
+            except Exception as e:
+                logger.warning(f"[Backend] Failed to generate explanation for highlight [{h.start:.1f}s-{h.end:.1f}s]: {e}", exc_info=True)
+                explanation = None
+            
+            highlights.append(Highlight(
                 start=h.start,
                 end=h.end,
                 title=h.title,
-                summary=h.summary,
+                summary=None,  # Summary no longer used
                 score=h.score,
-            )
-            for h in highlights_db
-        ]
+                explanation=explanation,
+            ))
         
         logger.info(f"[Backend] Returning {len(highlights)} highlights for video {video_id}")
         return HighlightsResponse(video_id=video_uuid, highlights=highlights)
@@ -545,6 +727,315 @@ async def get_highlights(
     except Exception as e:
         logger.error(f"Error retrieving highlights: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error retrieving highlights")
+
+
+@app.get("/videos/{video_id}/segments", response_model=SegmentsResponse)
+async def get_segments(
+    video_id: str,
+    label: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrieve segment analyses for a video.
+    
+    Optional query parameter:
+    - label: Filter by label (FLUFF, REPEATED, USEFUL, NEUTRAL)
+    
+    Returns list of segments with labels, ratings, and scores.
+    Returns empty list if no segments found.
+    Returns 404 if video not found.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        
+        # Verify video exists
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get segments, optionally filtered by label
+        if label:
+            if label.upper() != "FLUFF":
+                raise HTTPException(status_code=400, detail="Invalid label. Must be FLUFF")
+            segments_db = await crud.get_segments_by_label(db, video_uuid, label.upper())
+        else:
+            segments_db = await crud.get_video_segments(db, video_uuid)
+        
+        logger.info(f"[Backend] /videos/{video_id}/segments - Found {len(segments_db)} segments")
+        
+        # Get retention metrics for FLUFF segments
+        from utils.explanation_builder import build_fluff_explanation, build_fluff_explanation_from_segment
+        from utils.retention_scoring import RETENTION_THRESHOLD
+        from models import RetentionMetrics as RetentionMetricsModel
+        
+        # Fetch all retention metrics for the video and create a lookup map
+        retention_metrics_db = await crud.get_retention_metrics_by_video(db, video_uuid)
+        retention_metrics_map = {rm.segment_id: rm for rm in retention_metrics_db}
+        logger.info(f"[Backend] Found {len(retention_metrics_map)} retention metrics for video {video_id}")
+        
+        segments = []
+        for s in segments_db:
+            explanation = None
+            
+            # Generate explanation for FLUFF segments
+            if s.label == "FLUFF":
+                segment_id = s.segment_id
+                logger.debug(f"[Backend] Processing FLUFF segment {segment_id}")
+                
+                if segment_id in retention_metrics_map:
+                    rm = retention_metrics_map[segment_id]
+                    # Convert JSONB metrics to Pydantic model
+                    try:
+                        metrics_dict = rm.metrics if isinstance(rm.metrics, dict) else rm.metrics
+                        retention_metrics = RetentionMetricsModel(**metrics_dict)
+                        explanation = build_fluff_explanation(
+                            retention_metrics,
+                            rm.retention_value,
+                            RETENTION_THRESHOLD,
+                        )
+                        logger.debug(f"[Backend] Generated explanation from retention metrics for segment {segment_id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to generate explanation for segment {segment_id}: {e}", exc_info=True)
+                        # Fallback to segment-based explanation
+                        try:
+                            explanation = build_fluff_explanation_from_segment(
+                                s.label,
+                                s.repetition_score,
+                                s.filler_density,
+                                s.visual_change_score,
+                                s.usefulness_score,
+                            )
+                            logger.debug(f"[Backend] Generated fallback explanation for segment {segment_id}")
+                        except Exception as e2:
+                            logger.error(f"Failed to generate fallback explanation for segment {segment_id}: {e2}", exc_info=True)
+                else:
+                    # No retention metrics available, use segment scores
+                    logger.debug(f"[Backend] No retention metrics for segment {segment_id}, using segment scores")
+                    try:
+                        explanation = build_fluff_explanation_from_segment(
+                            s.label,
+                            s.repetition_score,
+                            s.filler_density,
+                            s.visual_change_score,
+                            s.usefulness_score,
+                        )
+                        logger.debug(f"[Backend] Generated segment-based explanation for segment {segment_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to generate segment-based explanation for segment {segment_id}: {e}", exc_info=True)
+                
+                # If no explanation was generated, create a minimal one
+                if not explanation:
+                    logger.warning(f"[Backend] No explanation generated for FLUFF segment {segment_id}, creating minimal explanation")
+                    from models import VerdictExplanation
+                    explanation = VerdictExplanation(
+                        verdict="FLUFF",
+                        confidence="medium",
+                        evidence=[s.reason] if s.reason else ["Low quality segment"],
+                        action_hint="Remove",
+                    )
+                
+                if explanation:
+                    logger.debug(f"[Backend] Explanation for segment {segment_id}: verdict={explanation.verdict}, confidence={explanation.confidence}, evidence={len(explanation.evidence)} items")
+            
+            segments.append(
+                SegmentAnalysis(
+                    id=s.id,
+                    start_time=s.start_time,
+                    end_time=s.end_time,
+                    label=s.label,
+                    rating=s.rating,
+                    grade=getattr(s, 'grade', 'C'),
+                    reason=s.reason,
+                    repetition_score=s.repetition_score,
+                    filler_density=s.filler_density,
+                    visual_change_score=s.visual_change_score,
+                    usefulness_score=s.usefulness_score,
+                    explanation=explanation,
+                )
+            )
+        
+        logger.info(f"[Backend] Returning {len(segments)} segments for video {video_id}")
+        return SegmentsResponse(video_id=video_uuid, segments=segments)
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving segments: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving segments")
+
+
+@app.get("/videos/{video_id}/retention-metrics")
+async def get_retention_metrics(
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrieve retention metrics for a video.
+    
+    Returns list of retention analyses with detailed metrics.
+    Returns empty list if no retention metrics found.
+    Returns 404 if video not found.
+    """
+    try:
+        from models import RetentionAnalysis
+        
+        video_uuid = UUID(video_id)
+        
+        # Verify video exists
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get retention metrics
+        retention_metrics_db = await crud.get_retention_metrics_by_video(db, video_uuid)
+        
+        logger.info(f"[Backend] /videos/{video_id}/retention-metrics - Found {len(retention_metrics_db)} retention metrics")
+        
+        # Convert to Pydantic models
+        retention_analyses = []
+        for rm in retention_metrics_db:
+            analysis = RetentionAnalysis(
+                video_id=str(rm.video_id),
+                segment_id=rm.segment_id,
+                time_range=rm.time_range,
+                text=rm.text,
+                metrics=rm.metrics,
+                retention_value=rm.retention_value,
+                decision=rm.decision,
+            )
+            retention_analyses.append(analysis)
+        
+        logger.info(f"[Backend] Returning {len(retention_analyses)} retention analyses for video {video_id}")
+        return {"video_id": str(video_uuid), "retention_analyses": retention_analyses}
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving retention metrics: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving retention metrics")
+
+
+
+
+@app.post("/videos/{video_id}/segments/{segment_id}/feedback", response_model=SegmentFeedbackResponse, status_code=201)
+async def submit_segment_feedback(
+    video_id: str,
+    segment_id: str,
+    feedback_request: SegmentFeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Submit feedback for a video segment.
+    
+    Feedback types:
+    - GREAT: +0.6 adjustment to usefulness score
+    - FINE: -0.4 adjustment to usefulness score
+    - WRONG: -0.6 adjustment to usefulness score
+    
+    Returns feedback record and updates segment rating/usefulness_score.
+    
+    If segment_id is "lookup", will use start_time and end_time from request body to find segment.
+    """
+    try:
+        from utils.learning import update_segment_calibration_online
+        
+        video_uuid = UUID(video_id)
+        
+        # Verify video exists
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get segment - either by ID or by time range
+        if segment_id == "lookup" and feedback_request.start_time is not None and feedback_request.end_time is not None:
+            segment = await crud.get_video_segment_by_time_range(
+                db,
+                video_uuid,
+                feedback_request.start_time,
+                feedback_request.end_time,
+            )
+            if not segment:
+                raise HTTPException(status_code=404, detail="Segment not found by time range")
+        else:
+            try:
+                segment_uuid = UUID(segment_id)
+                segment = await crud.get_video_segment_by_id(db, segment_uuid)
+                if not segment:
+                    raise HTTPException(status_code=404, detail="Segment not found")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid segment_id format")
+        
+        # Verify segment belongs to video
+        if segment.video_id != video_uuid:
+            raise HTTPException(status_code=400, detail="Segment does not belong to this video")
+        
+        # Validate feedback type
+        feedback_type = feedback_request.feedback_type.upper()
+        if feedback_type not in ["GREAT", "FINE", "WRONG"]:
+            raise HTTPException(status_code=400, detail="Invalid feedback_type. Must be GREAT, FINE, or WRONG")
+        
+        # Calculate adjustment
+        adjustments = {
+            "GREAT": 0.6,
+            "FINE": -0.4,
+            "WRONG": -0.6,
+        }
+        adjustment = adjustments[feedback_type]
+        
+        # Store original rating for calibration
+        original_rating = segment.rating
+        original_usefulness = segment.usefulness_score
+        
+        # Calculate new rating and usefulness_score
+        new_rating = max(0.0, min(1.0, segment.rating + adjustment))
+        new_usefulness_score = max(0.0, min(1.0, segment.usefulness_score + adjustment))
+        
+        # Create feedback record
+        feedback = await crud.create_segment_feedback(
+            db,
+            video_segment_id=segment.id,
+            feedback_type=feedback_type,
+        )
+        
+        # Update segment rating and usefulness_score
+        await crud.update_video_segment_rating(
+            db,
+            segment_id=segment.id,
+            new_rating=new_rating,
+            new_usefulness_score=new_usefulness_score,
+        )
+        
+        # Feed into calibration system
+        await update_segment_calibration_online(
+            db,
+            segment_id=segment.id,
+            predicted_rating=original_rating,
+            actual_rating=new_rating,
+        )
+        
+        logger.info(
+            f"Segment feedback submitted: segment_id={segment.id}, "
+            f"feedback_type={feedback_type}, rating={original_rating:.2f} -> {new_rating:.2f}"
+        )
+        
+        return SegmentFeedbackResponse(
+            id=feedback.id,
+            video_segment_id=feedback.video_segment_id,
+            feedback_type=feedback.feedback_type,
+            created_at=feedback.created_at,
+        )
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error submitting segment feedback: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error submitting segment feedback")
 
 
 @app.get("/videos/{video_id}/moments", response_model=MomentsResponse)
@@ -601,6 +1092,7 @@ async def download_video(
 ):
     """
     Stream video for playback with Range request support.
+    Checks for local preview first, then falls back to S3.
     """
     try:
         video_uuid = UUID(video_id)
@@ -608,6 +1100,19 @@ async def download_video(
         
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Check for local preview first (instant preview with cuts)
+        from utils.preview_cache import get_preview_path
+        preview_path = get_preview_path(video_uuid)
+        if preview_path:
+            # Serve local preview file with range support
+            from fastapi.responses import FileResponse
+            range_header = request.headers.get("range")
+            return FileResponse(
+                preview_path,
+                media_type="video/mp4",
+                headers={"Accept-Ranges": "bytes"},
+            )
         
         storage = get_storage_instance()
         
@@ -637,6 +1142,14 @@ async def download_video(
                     await stream_ctx.__aexit__(None, None, None)
                     await client.aclose()
                     raise HTTPException(status_code=404, detail="Video file not found in storage")
+                
+                # Handle 416 Range Not Satisfiable - retry without range header
+                if response.status_code == 416:
+                    await stream_ctx.__aexit__(None, None, None)
+                    # Retry without range header to get full file
+                    stream_ctx = client.stream("GET", presigned_url, follow_redirects=True)
+                    response = await stream_ctx.__aenter__()
+                    range_header = None  # Clear range header since we're getting full file
                 
                 # Get content info
                 content_type = response.headers.get("content-type", "video/mp4")
@@ -769,6 +1282,14 @@ async def download_moment(
                         await stream_ctx.__aexit__(None, None, None)
                         await client.aclose()
                         raise HTTPException(status_code=404, detail="Moment file not found in storage")
+                    
+                    # Handle 416 Range Not Satisfiable - retry without range header
+                    if response.status_code == 416:
+                        await stream_ctx.__aexit__(None, None, None)
+                        # Retry without range header to get full file
+                        stream_ctx = client.stream("GET", presigned_url, follow_redirects=True)
+                        response = await stream_ctx.__aenter__()
+                        range_header = None  # Clear range header since we're getting full file
                     
                     # Determine content type
                     content_type = response.headers.get("content-type", "video/mp4")
@@ -1065,61 +1586,6 @@ async def get_moment_detail(
     except Exception as e:
         logger.error(f"Error retrieving moment detail: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error retrieving moment detail")
-
-
-@app.post("/moments/{moment_id}/feedback", status_code=201)
-async def submit_moment_feedback(
-    moment_id: str,
-    feedback: MomentFeedbackRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Submit feedback for a moment.
-    
-    Finds the associated highlight and creates feedback with confidence score (0-100) and optional text.
-    Returns 404 if moment not found.
-    """
-    try:
-        moment_uuid = UUID(moment_id)
-        
-        # Get moment
-        moment = await crud.get_moment_by_id(db, moment_uuid)
-        if not moment:
-            raise HTTPException(status_code=404, detail="Moment not found")
-        
-        # Find associated highlight by matching start/end times
-        highlight = await db.execute(
-            select(HighlightDB).where(
-                HighlightDB.video_id == moment.video_id,
-                HighlightDB.start <= moment.start,
-                HighlightDB.end >= moment.end,
-            ).limit(1)
-        )
-        highlight_obj = highlight.scalar_one_or_none()
-        
-        if not highlight_obj:
-            raise HTTPException(status_code=404, detail="No associated highlight found for this moment")
-        
-        # Create feedback with confidence score and text
-        feedback_record = await crud.create_feedback(
-            db,
-            highlight_id=highlight_obj.id,
-            feedback_type=FeedbackType.CONFIDENCE_SCORE.value,
-            confidence_score=feedback.confidence_score,
-            text_feedback=feedback.text_feedback,
-        )
-        
-        logger.info(f"Moment feedback submitted for moment {moment_id}: confidence_score={feedback.confidence_score}")
-        
-        return {"id": str(feedback_record.id), "status": "created"}
-    
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid moment ID format")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error submitting moment feedback: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error submitting moment feedback")
 
 
 @app.post("/moments/{moment_id}/save", status_code=201)
@@ -1423,6 +1889,13 @@ async def delete_all_moments_endpoint(
             except Exception as e:
                 logger.warning(f"Failed to delete storage file for moment {moment.id}: {str(e)}")
         
+        # Clean up orphaned audio files after deleting all moments
+        try:
+            from utils.audio import cleanup_audio_directory
+            cleanup_audio_directory()
+        except Exception as e:
+            logger.warning(f"Failed to cleanup audio directory: {str(e)}")
+        
         # Delete all moments from database
         deleted_count = await crud.delete_all_moments(db)
         
@@ -1433,215 +1906,6 @@ async def delete_all_moments_endpoint(
     except Exception as e:
         logger.error(f"Error deleting all moments: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error deleting moments")
-
-
-@app.post("/highlights/{highlight_id}/feedback", status_code=201)
-async def submit_feedback(
-    highlight_id: str,
-    feedback: HighlightFeedbackRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Submit feedback for a highlight.
-    
-    Accepts explicit feedback (positive, negative, confidence_score) for a highlight.
-    Returns 404 if highlight not found.
-    """
-    try:
-        highlight_uuid = UUID(highlight_id)
-        
-        highlight = await db.execute(select(HighlightDB).where(HighlightDB.id == highlight_uuid))
-        highlight_obj = highlight.scalar_one_or_none()
-        
-        if not highlight_obj:
-            raise HTTPException(status_code=404, detail="Highlight not found")
-        
-        if feedback.feedback_type == FeedbackType.CONFIDENCE_SCORE.value and feedback.confidence_score is None:
-            raise HTTPException(status_code=400, detail="Confidence score is required for confidence_score feedback type")
-        
-        feedback_record = await crud.create_feedback(
-            db,
-            highlight_id=highlight_uuid,
-            feedback_type=feedback.feedback_type.value,
-            confidence_score=feedback.confidence_score,
-            text_feedback=feedback.text_feedback,
-        )
-        
-        logger.info(f"Feedback submitted for highlight {highlight_id}: {feedback.feedback_type}")
-        
-        return {"id": str(feedback_record.id), "status": "created"}
-    
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid highlight ID format")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error submitting feedback: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error submitting feedback")
-
-
-@app.post("/highlights/{highlight_id}/view", status_code=201)
-async def track_highlight_view(
-    highlight_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Track that a user viewed a highlight (implicit positive feedback).
-    
-    Returns 404 if highlight not found.
-    """
-    try:
-        highlight_uuid = UUID(highlight_id)
-        
-        highlight = await db.execute(select(HighlightDB).where(HighlightDB.id == highlight_uuid))
-        highlight_obj = highlight.scalar_one_or_none()
-        
-        if not highlight_obj:
-            raise HTTPException(status_code=404, detail="Highlight not found")
-        
-        feedback_record = await crud.create_feedback(
-            db,
-            highlight_id=highlight_uuid,
-            feedback_type=FeedbackType.VIEW.value,
-            confidence_score=None,
-        )
-        
-        return {"id": str(feedback_record.id), "status": "created"}
-    
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid highlight ID format")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error tracking view: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error tracking view")
-
-
-@app.post("/highlights/{highlight_id}/skip", status_code=201)
-async def track_highlight_skip(
-    highlight_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Track that a user skipped a highlight (implicit negative feedback).
-    
-    Returns 404 if highlight not found.
-    """
-    try:
-        highlight_uuid = UUID(highlight_id)
-        
-        highlight = await db.execute(select(HighlightDB).where(HighlightDB.id == highlight_uuid))
-        highlight_obj = highlight.scalar_one_or_none()
-        
-        if not highlight_obj:
-            raise HTTPException(status_code=404, detail="Highlight not found")
-        
-        feedback_record = await crud.create_feedback(
-            db,
-            highlight_id=highlight_uuid,
-            feedback_type=FeedbackType.SKIP.value,
-            confidence_score=None,
-        )
-        
-        return {"id": str(feedback_record.id), "status": "created"}
-    
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid highlight ID format")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error tracking skip: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error tracking skip")
-
-
-@app.post("/moments/{moment_id}/view", status_code=201)
-async def track_moment_view(
-    moment_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Track that a user viewed a moment (implicit positive feedback for associated highlight).
-    
-    Returns 404 if moment not found.
-    """
-    try:
-        moment_uuid = UUID(moment_id)
-        moment = await crud.get_moment_by_id(db, moment_uuid)
-        
-        if not moment:
-            raise HTTPException(status_code=404, detail="Moment not found")
-        
-        highlight = await db.execute(
-            select(HighlightDB).where(
-                HighlightDB.video_id == moment.video_id,
-                HighlightDB.start <= moment.start,
-                HighlightDB.end >= moment.end,
-            ).limit(1)
-        )
-        highlight_obj = highlight.scalar_one_or_none()
-        
-        if highlight_obj:
-            feedback_record = await crud.create_feedback(
-                db,
-                highlight_id=highlight_obj.id,
-                feedback_type=FeedbackType.VIEW.value,
-                rating=None,
-            )
-            return {"id": str(feedback_record.id), "status": "created"}
-        else:
-            return {"status": "created", "note": "No associated highlight found"}
-    
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid moment ID format")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error tracking moment view: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error tracking moment view")
-
-
-@app.get("/highlights/{highlight_id}/analytics", response_model=FeedbackAnalyticsResponse)
-async def get_highlight_analytics(
-    highlight_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Get aggregated feedback metrics for a highlight.
-    
-    Returns analytics including view count, skip count, ratings, etc.
-    Returns 404 if highlight not found.
-    """
-    try:
-        highlight_uuid = UUID(highlight_id)
-        
-        highlight = await db.execute(select(HighlightDB).where(HighlightDB.id == highlight_uuid))
-        highlight_obj = highlight.scalar_one_or_none()
-        
-        if not highlight_obj:
-            raise HTTPException(status_code=404, detail="Highlight not found")
-        
-        stats = await crud.get_feedback_stats(db, highlight_uuid)
-        
-        return FeedbackAnalyticsResponse(
-            highlight_id=highlight_uuid,
-            total_feedback=stats["total_feedback"],
-            positive_count=stats["positive_count"],
-            negative_count=stats["negative_count"],
-            view_count=stats["view_count"],
-            skip_count=stats["skip_count"],
-            share_count=stats["share_count"],
-            average_rating=stats["average_rating"],
-            rating_count=stats["rating_count"],
-            created_at=highlight_obj.created_at,
-        )
-    
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid highlight ID format")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error retrieving analytics: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error retrieving analytics")
 
 
 @app.get("/admin/prompt-versions", response_model=List[PromptVersionResponse])
@@ -1816,29 +2080,290 @@ async def run_learning_pipeline(
         raise HTTPException(status_code=500, detail=f"Internal server error running learning pipeline: {str(e)}")
 
 
-@app.get("/projects", response_model=ProjectsResponse)
-async def get_projects(
+@app.get("/videos/{video_id}/thumbnail")
+async def get_video_thumbnail(
+    video_id: str,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get all projects (videos that have moments).
+    Get thumbnail image for a video.
     
-    Returns list of projects with video_id, created_at, duration, and moment_count.
+    Returns the thumbnail image file.
+    For S3 storage, proxies the thumbnail to avoid CORB issues.
+    For local storage, streams the file directly.
+    If thumbnail doesn't exist, generates it on-demand from the video.
+    Returns 404 if video not found.
     """
     try:
-        logger.info("[Backend] /projects endpoint called - fetching videos with moments")
-        videos = await crud.get_videos_with_moments(db)
-        logger.info(f"[Backend] Found {len(videos)} videos with moments")
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
         
-        projects = [
-            ProjectResponse(
-                video_id=video.id,
-                created_at=video.created_at,
-                duration=video.duration,
-                moment_count=len(video.moments),
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        storage = get_storage_instance()
+        
+        # Generate thumbnail on-demand if it doesn't exist
+        if not video.thumbnail_path:
+            try:
+                logger.info(f"Generating thumbnail on-demand for video {video_id}")
+                
+                # Get video file path
+                video_file_path = storage.get_video_path(video.storage_path)
+                
+                # Generate thumbnail
+                thumbnail_path = await generate_video_thumbnail_async(video_file_path, time_offset=1.0)
+                
+                # Update video with thumbnail path
+                video.thumbnail_path = thumbnail_path
+                await db.commit()
+                await db.refresh(video)
+                
+                logger.info(f"Successfully generated thumbnail for video {video_id}: {thumbnail_path}")
+            except Exception as e:
+                logger.error(f"Failed to generate thumbnail on-demand for video {video_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
+        
+        # Handle S3 storage - proxy the thumbnail to avoid CORB issues
+        if isinstance(storage, S3Storage):
+            try:
+                import httpx
+                
+                presigned_url = storage.get_video_path(video.thumbnail_path)
+                
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get(presigned_url)
+                    
+                    if response.status_code == 404:
+                        logger.info(f"Thumbnail not found in S3 for video {video_id}, generating on-demand")
+                        try:
+                            video_file_path = storage.get_video_path(video.storage_path)
+                            thumbnail_path = await generate_video_thumbnail_async(video_file_path, time_offset=1.0)
+                            video.thumbnail_path = thumbnail_path
+                            await db.commit()
+                            await db.refresh(video)
+                            presigned_url = storage.get_video_path(video.thumbnail_path)
+                            import asyncio
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                await asyncio.sleep(0.5 * (attempt + 1))
+                                response = await client.get(presigned_url)
+                                if response.status_code == 200:
+                                    thumbnail_data = response.content
+                                    break
+                                elif attempt == max_retries - 1:
+                                    raise HTTPException(status_code=500, detail="Failed to fetch generated thumbnail after retries")
+                        except Exception as gen_error:
+                            logger.error(f"Failed to generate thumbnail on-demand for video {video_id}: {str(gen_error)}", exc_info=True)
+                            raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
+                    else:
+                        response.raise_for_status()
+                        thumbnail_data = response.content
+                
+                from fastapi.responses import Response
+                return Response(
+                    content=thumbnail_data,
+                    media_type="image/jpeg",
+                    headers={
+                        "Cache-Control": "public, max-age=3600",
+                        "Content-Disposition": f'inline; filename="thumbnail_{video_id}.jpg"',
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Error proxying thumbnail from S3 for video {video_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Error accessing thumbnail file")
+        
+        # Handle local storage
+        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+        thumbnail_full_path = os.path.join(upload_dir, video.thumbnail_path)
+        
+        if not os.path.exists(thumbnail_full_path):
+            logger.error(f"Thumbnail file not found at path: {thumbnail_full_path}")
+            raise HTTPException(status_code=404, detail="Thumbnail file not found")
+        
+        return FileResponse(
+            thumbnail_full_path,
+            media_type="image/jpeg",
+            filename=f"thumbnail_{video_id}.jpg",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+            }
+        )
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving video thumbnail: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving video thumbnail")
+
+
+@app.get("/timelines/{video_id}/thumbnail")
+async def get_timeline_thumbnail(
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get thumbnail image for a timeline.
+    
+    Returns the thumbnail image file.
+    For S3 storage, proxies the thumbnail to avoid CORB issues.
+    For local storage, streams the file directly.
+    If thumbnail doesn't exist, falls back to video thumbnail or generates it on-demand.
+    Returns 404 if timeline/video not found.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        timeline = await crud.get_timeline_by_video_id(db, video_uuid)
+        
+        if not timeline:
+            raise HTTPException(status_code=404, detail="Timeline not found")
+        
+        video = timeline.video
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        storage = get_storage_instance()
+        
+        # Use timeline thumbnail if available, otherwise fall back to video thumbnail
+        thumbnail_path = timeline.thumbnail_path or video.thumbnail_path
+        
+        # Generate thumbnail on-demand if it doesn't exist
+        if not thumbnail_path:
+            try:
+                logger.info(f"Generating thumbnail on-demand for timeline {video_id}")
+                
+                # Get video file path
+                video_file_path = storage.get_video_path(video.storage_path)
+                
+                # Generate thumbnail
+                thumbnail_path = await generate_video_thumbnail_async(video_file_path, time_offset=1.0)
+                
+                # Update timeline with thumbnail path
+                timeline.thumbnail_path = thumbnail_path
+                await db.commit()
+                await db.refresh(timeline)
+                
+                logger.info(f"Successfully generated thumbnail for timeline {video_id}: {thumbnail_path}")
+            except Exception as e:
+                logger.error(f"Failed to generate thumbnail on-demand for timeline {video_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
+        
+        # Handle S3 storage - proxy the thumbnail to avoid CORB issues
+        if isinstance(storage, S3Storage):
+            try:
+                import httpx
+                
+                presigned_url = storage.get_video_path(thumbnail_path)
+                
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.get(presigned_url)
+                    
+                    if response.status_code == 404:
+                        logger.info(f"Thumbnail not found in S3 for timeline {video_id}, generating on-demand")
+                        try:
+                            video_file_path = storage.get_video_path(video.storage_path)
+                            thumbnail_path = await generate_video_thumbnail_async(video_file_path, time_offset=1.0)
+                            timeline.thumbnail_path = thumbnail_path
+                            await db.commit()
+                            await db.refresh(timeline)
+                            presigned_url = storage.get_video_path(thumbnail_path)
+                            import asyncio
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                await asyncio.sleep(0.5 * (attempt + 1))
+                                response = await client.get(presigned_url)
+                                if response.status_code == 200:
+                                    thumbnail_data = response.content
+                                    break
+                                elif attempt == max_retries - 1:
+                                    raise HTTPException(status_code=500, detail="Failed to fetch generated thumbnail after retries")
+                        except Exception as gen_error:
+                            logger.error(f"Failed to generate thumbnail on-demand for timeline {video_id}: {str(gen_error)}", exc_info=True)
+                            raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
+                    else:
+                        response.raise_for_status()
+                        thumbnail_data = response.content
+                
+                from fastapi.responses import Response
+                return Response(
+                    content=thumbnail_data,
+                    media_type="image/jpeg",
+                    headers={
+                        "Cache-Control": "public, max-age=3600",
+                        "Content-Disposition": f'inline; filename="thumbnail_{video_id}.jpg"',
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Error proxying thumbnail from S3 for timeline {video_id}: {str(e)}", exc_info=True)
+                raise HTTPException(status_code=500, detail="Error accessing thumbnail file")
+        
+        # Handle local storage
+        upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
+        thumbnail_full_path = os.path.join(upload_dir, thumbnail_path)
+        
+        if not os.path.exists(thumbnail_full_path):
+            logger.error(f"Thumbnail file not found at path: {thumbnail_full_path}")
+            raise HTTPException(status_code=404, detail="Thumbnail file not found")
+        
+        return FileResponse(
+            thumbnail_full_path,
+            media_type="image/jpeg",
+            filename=f"thumbnail_{video_id}.jpg",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+            }
+        )
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving timeline thumbnail: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error retrieving timeline thumbnail")
+
+
+@app.get("/projects", response_model=ProjectsResponse)
+async def get_projects(
+    db: AsyncSession = Depends(get_db),
+    clerk_user_id: Optional[str] = Depends(get_clerk_user_id),
+):
+    """
+    Get all timelines (projects) for the authenticated user.
+    
+    Returns list of timelines with video_id, created_at, duration, and moment_count.
+    A timeline is created when a user starts working on a video.
+    Filters by clerk_user_id if provided in headers.
+    """
+    try:
+        logger.info(f"[Backend] /projects endpoint called - fetching timelines for user (user_id: {clerk_user_id})")
+        timelines = await crud.get_timelines_by_user(db, clerk_user_id=clerk_user_id)
+        logger.info(f"[Backend] Found {len(timelines)} timelines for user {clerk_user_id}")
+        
+        projects = []
+        for timeline in timelines:
+            video = timeline.video
+            # Use timeline thumbnail if available, fallback to video thumbnail
+            # Always return thumbnail URL even if not generated yet - backend will generate on-demand
+            thumbnail_url = None
+            if timeline.thumbnail_path:
+                thumbnail_url = f"/timelines/{video.id}/thumbnail"
+            else:
+                # Always return video thumbnail URL - it will be generated on-demand if needed
+                thumbnail_url = f"/videos/{video.id}/thumbnail"
+            
+            projects.append(
+                ProjectResponse(
+                    video_id=video.id,
+                    created_at=timeline.created_at,
+                    duration=video.duration,
+                    moment_count=len(video.moments),
+                    thumbnail_url=thumbnail_url,
+                    project_name=timeline.project_name,
+                )
             )
-            for video in videos
-        ]
         
         logger.info(f"[Backend] Returning {len(projects)} projects: {[str(p.video_id) for p in projects]}")
         return ProjectsResponse(projects=projects)
@@ -1887,6 +2412,423 @@ async def get_project(
     except Exception as e:
         logger.error(f"Error retrieving project: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error retrieving project")
+
+
+@app.post("/videos/{video_id}/cut", status_code=200)
+async def store_pending_cuts(
+    video_id: str,
+    cut_request: CutVideoRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Store pending cuts for a video without processing.
+    This allows users to accumulate multiple cuts and apply them all at once when saving.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Convert request segments to dict format for JSON storage
+        new_segments = [{"start_time": seg.start_time, "end_time": seg.end_time} for seg in cut_request.segments_to_remove]
+        
+        if not new_segments:
+            raise HTTPException(status_code=400, detail="No segments to remove")
+        
+        # Merge with existing pending cuts (if any)
+        existing_cuts = video.pending_cuts if video.pending_cuts else []
+        merged_cuts = existing_cuts + new_segments
+        
+        # Remove duplicates (same start_time and end_time)
+        seen = set()
+        unique_cuts = []
+        for cut in merged_cuts:
+            key = (cut["start_time"], cut["end_time"])
+            if key not in seen:
+                seen.add(key)
+                unique_cuts.append(cut)
+        
+        # Sort by start_time
+        unique_cuts.sort(key=lambda x: x["start_time"])
+        
+        # Store pending cuts
+        video.pending_cuts = unique_cuts
+        await db.commit()
+        
+        # Generate local preview instantly in background (non-blocking)
+        try:
+            from utils.video_cutter import generate_local_preview
+            segments_to_remove = [(cut["start_time"], cut["end_time"]) for cut in unique_cuts]
+            # Generate preview in background
+            background_tasks.add_task(generate_local_preview, video_uuid, segments_to_remove, db)
+            logger.info(f"Started generating local preview for video {video_uuid}")
+        except Exception as e:
+            logger.warning(f"Failed to schedule local preview generation (non-critical): {str(e)}")
+        
+        return {
+            "status": "success",
+            "video_id": str(video_uuid),
+            "pending_cuts": unique_cuts,
+            "total_pending": len(unique_cuts),
+        }
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error storing pending cuts: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/videos/{video_id}/cut", status_code=200)
+async def get_pending_cuts(
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get pending cuts for a video."""
+    try:
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        pending_cuts = video.pending_cuts if video.pending_cuts else []
+        
+        return {
+            "status": "success",
+            "video_id": str(video_uuid),
+            "pending_cuts": pending_cuts,
+            "total_pending": len(pending_cuts),
+        }
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting pending cuts: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.delete("/videos/{video_id}/cut", status_code=200)
+async def clear_pending_cuts(
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear all pending cuts for a video."""
+    try:
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        video.pending_cuts = None
+        await db.commit()
+        
+        # Clear local preview if it exists
+        try:
+            from utils.preview_cache import clear_preview
+            clear_preview(video_uuid)
+            logger.info(f"Cleared preview for video {video_uuid}")
+        except Exception as e:
+            logger.warning(f"Failed to clear preview (non-critical): {str(e)}")
+        
+        return {
+            "status": "success",
+            "video_id": str(video_uuid),
+            "message": "Pending cuts cleared",
+        }
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error clearing pending cuts: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/videos/{video_id}/cut/save", status_code=200)
+async def save_video_cuts(
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Apply all pending cuts to the video and save.
+    This processes the video cutting and replaces the original video file.
+    """
+    try:
+        from utils.video_cutter import process_video_cutting
+        
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        pending_cuts = video.pending_cuts if video.pending_cuts else []
+        if not pending_cuts:
+            raise HTTPException(status_code=400, detail="No pending cuts to apply")
+        
+        # Convert to tuples for processing
+        segments_to_remove = [(cut["start_time"], cut["end_time"]) for cut in pending_cuts]
+        
+        # Check if we have a local preview (much faster to upload)
+        from utils.preview_cache import get_preview_path, clear_preview
+        preview_path = get_preview_path(video_uuid)
+        
+        if preview_path:
+            # Use local preview - upload it to S3 and replace old version
+            logger.info(f"Using local preview for video {video_uuid} from {preview_path}")
+            storage = get_storage_instance()
+            
+            if isinstance(storage, S3Storage):
+                original_storage_path = video.storage_path
+                
+                # Backup old video
+                old_backup_path = original_storage_path.replace("videos/", "videos/backup_")
+                backup_created = False
+                try:
+                    storage.s3_client.copy_object(
+                        Bucket=storage.bucket_name,
+                        CopySource={"Bucket": storage.bucket_name, "Key": original_storage_path},
+                        Key=old_backup_path,
+                    )
+                    logger.info(f"Backed up old video to {old_backup_path}")
+                    backup_created = True
+                except Exception as e:
+                    logger.warning(f"Failed to backup old video (may not exist): {str(e)}")
+                
+                # Upload preview to S3
+                import uuid
+                new_filename = f"{uuid.uuid4()}.mp4"
+                new_storage_path = storage.store_video_from_file(preview_path, new_filename)
+                
+                # Update database
+                video.storage_path = new_storage_path
+                await db.commit()
+                
+                # Delete old video after successful upload
+                try:
+                    storage.delete_video(original_storage_path)
+                    logger.info(f"Deleted old video {original_storage_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete old video: {str(e)}")
+                
+                # Delete backup
+                try:
+                    storage.delete_video(old_backup_path)
+                    logger.info(f"Deleted backup video {old_backup_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete backup video: {str(e)}")
+                
+                # Clear preview cache
+                clear_preview(video_uuid)
+            else:
+                # Local storage - move preview to replace original
+                import shutil
+                old_full_path = storage.get_video_path(video.storage_path)
+                shutil.move(preview_path, old_full_path)
+                clear_preview(video_uuid)
+                new_storage_path = video.storage_path
+        else:
+            # No preview available, process video cutting normally
+            logger.info(f"No local preview found, processing video cutting for {video_uuid}")
+            new_storage_path = await process_video_cutting(video_uuid, segments_to_remove, db)
+        
+        # Refresh video object and clear pending cuts after successful save
+        await db.refresh(video)
+        video.pending_cuts = None
+        await db.commit()
+        
+        return {
+            "status": "success",
+            "video_id": str(video_uuid),
+            "storage_path": new_storage_path,
+            "segments_removed": len(segments_to_remove),
+            "message": "Video cuts saved successfully",
+        }
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving video cuts: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/videos/{video_id}/export")
+async def export_video(
+    video_id: str,
+    request: ExportVideoRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Export video in specified format with optional cuts applied.
+    
+    Formats:
+    - mp4: MP4 (H.264) - Default delivery
+    - mov_prores422: MOV (ProRes 422) - For real editors & post houses
+    - mov_prores4444: MOV (ProRes 4444) - For real editors & post houses
+    - webm: WebM (VP9) - YouTube optimization / modern web
+    - xml: XML (Final Cut Pro)
+    - edl: EDL (Premiere / Resolve)
+    - aaf: AAF (Avid / Pro pipelines)
+    """
+    try:
+        from utils.video_export import export_video as export_video_func, EXPORT_FORMATS
+        
+        video_uuid = UUID(video_id)
+        
+        if request.format not in EXPORT_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format. Supported formats: {', '.join(EXPORT_FORMATS.keys())}"
+            )
+        
+        segments_to_remove = None
+        if request.segments_to_remove:
+            segments_to_remove = [
+                (seg["start_time"], seg["end_time"])
+                for seg in request.segments_to_remove
+            ]
+        
+        output_path, mime_type = await export_video_func(
+            video_uuid,
+            request.format,
+            segments_to_remove,
+            db
+        )
+        
+        format_info = EXPORT_FORMATS[request.format]
+        filename = f"export_{video_id}.{format_info['extension']}"
+        
+        def cleanup_file():
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+            except Exception:
+                pass
+        
+        background_tasks.add_task(cleanup_file)
+        
+        return FileResponse(
+            path=output_path,
+            media_type=mime_type,
+            filename=filename,
+        )
+    
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error exporting video: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/timelines/{video_id}", status_code=200)
+async def save_timeline(
+    video_id: str,
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    clerk_user_id: Optional[str] = Depends(get_clerk_user_id),
+):
+    """
+    Save timeline state for a video.
+    
+    Creates or updates a timeline with editing state (markers, selections, etc.).
+    """
+    try:
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        timeline = await crud.create_or_update_timeline(
+            db=db,
+            video_id=video_uuid,
+            clerk_user_id=clerk_user_id,
+            project_name=request.get("projectName"),
+            markers=request.get("markers"),
+            selections=request.get("selections"),
+            current_time=request.get("currentTime"),
+            in_point=request.get("inPoint"),
+            out_point=request.get("outPoint"),
+            zoom=request.get("zoom"),
+            view_preferences=request.get("viewPreferences"),
+        )
+        
+        logger.info(f"Timeline saved for video {video_id}")
+        
+        return {
+            "status": "success",
+            "video_id": str(video_uuid),
+            "timeline_id": str(timeline.id),
+        }
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving timeline: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.get("/timelines/{video_id}", status_code=200)
+async def get_timeline(
+    video_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get timeline state for a video.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        timeline = await crud.get_timeline_by_video_id(db, video_uuid)
+        
+        if not timeline:
+            # Return default empty timeline state
+            return {
+                "video_id": str(video_uuid),
+                "project_name": None,
+                "markers": [],
+                "selections": [],
+                "current_time": 0.0,
+                "in_point": None,
+                "out_point": None,
+                "zoom": 1.0,
+                "view_preferences": {
+                    "snapEnabled": True,
+                    "loopPlayback": False,
+                },
+            }
+        
+        return {
+            "video_id": str(video_uuid),
+            "project_name": timeline.project_name,
+            "markers": timeline.markers or [],
+            "selections": timeline.selections or [],
+            "current_time": timeline.current_time or 0.0,
+            "in_point": timeline.in_point,
+            "out_point": timeline.out_point,
+            "zoom": timeline.zoom or 1.0,
+            "view_preferences": timeline.view_preferences or {
+                "snapEnabled": True,
+                "loopPlayback": False,
+            },
+        }
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except Exception as e:
+        logger.error(f"Error retrieving timeline: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 if __name__ == "__main__":

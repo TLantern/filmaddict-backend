@@ -2,12 +2,12 @@ import asyncio
 import logging
 import os
 import tempfile
-import urllib.request
 import uuid
 from typing import List, Tuple, Optional
 from uuid import UUID
 
 import ffmpeg
+import httpx
 from database import async_session_maker
 from db import crud
 from models import MomentRecord
@@ -201,7 +201,41 @@ def generate_thumbnail(moment_path: str, time_offset: float = 0.0) -> str:
         temp_moment_path = temp_moment_file.name
         temp_moment_file.close()
         
-        urllib.request.urlretrieve(moment_path, temp_moment_path)
+        # Use httpx to download from presigned URL (handles SSL better than urllib)
+        try:
+            # Try with SSL verification first
+            with httpx.Client(timeout=300.0, verify=True) as client:
+                response = client.get(moment_path)
+                response.raise_for_status()
+                with open(temp_moment_path, "wb") as f:
+                    f.write(response.content)
+        except (httpx.HTTPError, httpx.ConnectError) as e:
+            # If SSL verification fails, try without verification (common on macOS)
+            if "SSL" in str(e) or "certificate" in str(e).lower():
+                logger.warning(f"SSL certificate verification failed, retrying without verification: {str(e)}")
+                try:
+                    with httpx.Client(timeout=300.0, verify=False) as client:
+                        response = client.get(moment_path)
+                        response.raise_for_status()
+                        with open(temp_moment_path, "wb") as f:
+                            f.write(response.content)
+                except httpx.HTTPError as retry_error:
+                    logger.error(f"Failed to download video from S3 presigned URL after SSL retry: {str(retry_error)}")
+                    if os.path.exists(temp_moment_path):
+                        try:
+                            os.remove(temp_moment_path)
+                        except:
+                            pass
+                    raise Exception(f"Failed to download video from S3: {str(retry_error)}")
+            else:
+                logger.error(f"Failed to download video from S3 presigned URL: {str(e)}")
+                if os.path.exists(temp_moment_path):
+                    try:
+                        os.remove(temp_moment_path)
+                    except:
+                        pass
+                raise Exception(f"Failed to download video from S3: {str(e)}")
+        
         actual_moment_path = temp_moment_path
     else:
         if not os.path.exists(moment_path):
@@ -297,15 +331,31 @@ async def generate_thumbnail_async(moment_path: str, time_offset: float = 0.0) -
     return await loop.run_in_executor(None, generate_thumbnail, moment_path, time_offset)
 
 
-async def delete_moment_file(storage_path: str, thumbnail_path: Optional[str] = None) -> None:
+async def generate_video_thumbnail_async(video_path: str, time_offset: float = 1.0) -> str:
     """
-    Delete a moment file and optionally its thumbnail from storage.
+    Generate a thumbnail for a video file.
+    
+    Args:
+        video_path: Full path to the source video file (may be local or S3 presigned URL)
+        time_offset: Time offset in seconds from the start of the video (default: 1.0)
+        
+    Returns:
+        Relative storage path (e.g., "thumbnails/uuid.jpg")
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, generate_thumbnail, video_path, time_offset)
+
+
+async def delete_moment_file(storage_path: str, thumbnail_path: Optional[str] = None, audio_path: Optional[str] = None) -> None:
+    """
+    Delete a moment file and optionally its thumbnail and audio from storage.
     
     Handles both S3 and local storage.
     
     Args:
         storage_path: Relative storage path of the moment file
         thumbnail_path: Optional relative storage path of the thumbnail file
+        audio_path: Optional full path to audio file to delete
     """
     storage = get_storage_instance()
     
@@ -324,6 +374,14 @@ async def delete_moment_file(storage_path: str, thumbnail_path: Optional[str] = 
                 thumbnail_full_path = os.path.join(upload_dir, thumbnail_path)
                 if os.path.exists(thumbnail_full_path):
                     os.remove(thumbnail_full_path)
+        
+        # Delete audio file if provided
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+                logger.info(f"Deleted audio file: {audio_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete audio file {audio_path}: {str(e)}")
         
         logger.info(f"Deleted moment file: {storage_path}")
         if thumbnail_path:

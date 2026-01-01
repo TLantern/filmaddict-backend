@@ -1,22 +1,25 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict, TYPE_CHECKING
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from db.models import RetentionMetrics
 
 from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta
 
-from db.models import Video, Transcript, Highlight, Moment, HighlightFeedback, PromptVersion, CalibrationConfig, SavedMoment
-from models import VideoStatus, FeedbackType
+from db.models import Video, Transcript, Highlight, Moment, PromptVersion, CalibrationConfig, SavedMoment, VideoSegment, SegmentFeedback, Timeline
+from models import VideoStatus
 
 logger = logging.getLogger(__name__)
 
 
 async def create_video(
-    db: AsyncSession, storage_path: str, duration: Optional[float] = None, status: VideoStatus = VideoStatus.UPLOADED, aspect_ratio: Optional[str] = "16:9"
+    db: AsyncSession, storage_path: str, duration: Optional[float] = None, status: VideoStatus = VideoStatus.UPLOADED, aspect_ratio: Optional[str] = "16:9", clerk_user_id: Optional[str] = None, thumbnail_path: Optional[str] = None
 ) -> Video:
-    video = Video(storage_path=storage_path, duration=duration, aspect_ratio=aspect_ratio, status=status.value)
+    video = Video(storage_path=storage_path, duration=duration, aspect_ratio=aspect_ratio, status=status.value, clerk_user_id=clerk_user_id, thumbnail_path=thumbnail_path)
     db.add(video)
     await db.flush()
     await db.commit()
@@ -41,6 +44,11 @@ async def get_all_videos(db: AsyncSession, limit: int = 100, offset: int = 0) ->
 
 
 async def create_transcript(db: AsyncSession, video_id: UUID, segments: list) -> Transcript:
+    # Delete old transcripts for this video to avoid duplicates
+    await db.execute(delete(Transcript).where(Transcript.video_id == video_id))
+    await db.flush()
+    
+    # Create new transcript
     transcript = Transcript(video_id=video_id, segments=segments)
     db.add(transcript)
     await db.commit()
@@ -49,7 +57,13 @@ async def create_transcript(db: AsyncSession, video_id: UUID, segments: list) ->
 
 
 async def get_transcript_by_video_id(db: AsyncSession, video_id: UUID) -> Optional[Transcript]:
-    result = await db.execute(select(Transcript).where(Transcript.video_id == video_id))
+    # Return the most recent transcript if multiple exist
+    result = await db.execute(
+        select(Transcript)
+        .where(Transcript.video_id == video_id)
+        .order_by(Transcript.created_at.desc())
+        .limit(1)
+    )
     return result.scalar_one_or_none()
 
 
@@ -61,6 +75,33 @@ async def create_highlight(
     await db.commit()
     await db.refresh(highlight)
     return highlight
+
+
+async def create_highlights_batch(
+    db: AsyncSession, 
+    highlights_data: List[dict]
+) -> List[Highlight]:
+    """Batch create highlights with a single commit for better performance."""
+    if not highlights_data:
+        return []
+    
+    highlights = [
+        Highlight(
+            video_id=data["video_id"],
+            start=data["start"],
+            end=data["end"],
+            title=data.get("title"),
+            summary=data.get("summary"),
+            score=data["score"],
+            prompt_version_id=data.get("prompt_version_id")
+        )
+        for data in highlights_data
+    ]
+    db.add_all(highlights)
+    await db.commit()
+    for highlight in highlights:
+        await db.refresh(highlight)
+    return highlights
 
 
 async def get_highlights_by_video_id(db: AsyncSession, video_id: UUID) -> List[Highlight]:
@@ -99,21 +140,53 @@ async def get_all_moments(db: AsyncSession, limit: int = 100, offset: int = 0) -
     return list(result.scalars().all())
 
 
-async def get_videos_with_moments(db: AsyncSession) -> List[Video]:
-    """Get all videos that have at least one moment (projects)."""
+async def get_videos_by_user(db: AsyncSession, clerk_user_id: Optional[str] = None) -> List[Video]:
+    """Get all videos for a user, optionally filtered by clerk_user_id."""
+    try:
+        logger.info(f"[CRUD] Querying for videos by user (user_id: {clerk_user_id})...")
+        
+        if not clerk_user_id:
+            logger.info("[CRUD] No user_id provided, returning empty list")
+            return []
+        
+        # Build query for all videos by user
+        query = select(Video).where(Video.clerk_user_id == clerk_user_id)
+        
+        result = await db.execute(
+            query.order_by(Video.created_at.desc())
+            .options(selectinload(Video.moments))
+        )
+        videos = list(result.scalars().all())
+        logger.info(f"[CRUD] Retrieved {len(videos)} videos for user {clerk_user_id}")
+        for video in videos:
+            logger.info(f"[CRUD] Video {video.id}: {len(video.moments)} moments, status={video.status}, duration={video.duration}")
+        return videos
+    except Exception as e:
+        logger.error(f"[CRUD] Error getting videos by user: {str(e)}", exc_info=True)
+        raise
+
+
+async def get_videos_with_moments(db: AsyncSession, clerk_user_id: Optional[str] = None) -> List[Video]:
+    """Get all videos that have at least one moment (projects), optionally filtered by clerk_user_id."""
     from sqlalchemy import distinct
     try:
-        logger.info("[CRUD] Querying for videos with moments...")
-        # First check total moments count
-        total_moments_result = await db.execute(select(Moment))
-        total_moments = list(total_moments_result.scalars().all())
-        logger.info(f"[CRUD] Total moments in database: {len(total_moments)}")
-        if total_moments:
-            logger.info(f"[CRUD] Moments by video_id: {[(str(m.video_id), m.id) for m in total_moments[:10]]}")
+        logger.info(f"[CRUD] Querying for videos with moments (user_id: {clerk_user_id})...")
         
-        video_ids_result = await db.execute(
-            select(distinct(Moment.video_id))
-        )
+        # Build base query for video IDs with moments
+        video_ids_query = select(distinct(Moment.video_id))
+        
+        # If user_id is provided, filter videos by user_id first
+        if clerk_user_id:
+            user_videos_result = await db.execute(
+                select(Video.id).where(Video.clerk_user_id == clerk_user_id)
+            )
+            user_video_ids = [row[0] for row in user_videos_result.all()]
+            if not user_video_ids:
+                logger.info(f"[CRUD] No videos found for user {clerk_user_id}")
+                return []
+            video_ids_query = video_ids_query.where(Moment.video_id.in_(user_video_ids))
+        
+        video_ids_result = await db.execute(video_ids_query)
         video_ids = [row[0] for row in video_ids_result.all()]
         logger.info(f"[CRUD] Found {len(video_ids)} distinct video IDs with moments: {[str(vid) for vid in video_ids]}")
         
@@ -121,10 +194,15 @@ async def get_videos_with_moments(db: AsyncSession) -> List[Video]:
             logger.info("[CRUD] No videos with moments found, returning empty list")
             return []
         
+        # Build final query
+        query = select(Video).where(Video.id.in_(video_ids))
+        
+        # Apply user filter again for safety
+        if clerk_user_id:
+            query = query.where(Video.clerk_user_id == clerk_user_id)
+        
         result = await db.execute(
-            select(Video)
-            .where(Video.id.in_(video_ids))
-            .order_by(Video.created_at.desc())
+            query.order_by(Video.created_at.desc())
             .options(selectinload(Video.moments))
         )
         videos = list(result.scalars().all())
@@ -185,128 +263,6 @@ async def delete_video(db: AsyncSession, video_id: UUID) -> bool:
     result = await db.execute(delete(Video).where(Video.id == video_id))
     await db.commit()
     return result.rowcount > 0
-
-
-async def create_feedback(
-    db: AsyncSession,
-    highlight_id: UUID,
-    feedback_type: str,
-    confidence_score: Optional[float] = None,
-    text_feedback: Optional[str] = None,
-) -> HighlightFeedback:
-    feedback = HighlightFeedback(
-        highlight_id=highlight_id,
-        feedback_type=feedback_type,
-        confidence_score=confidence_score,
-        text_feedback=text_feedback,
-    )
-    db.add(feedback)
-    await db.commit()
-    await db.refresh(feedback)
-    
-    # Load highlight to get prompt_version_id for logging
-    highlight = await db.execute(select(Highlight).where(Highlight.id == highlight_id))
-    highlight_obj = highlight.scalar_one_or_none()
-    prompt_version_id = highlight_obj.prompt_version_id if highlight_obj else None
-    
-    # Log feedback received
-    logger.info("[ONLINE-LEARNING] Feedback received | "
-                f"type={feedback.feedback_type} | confidence_score={feedback.confidence_score} | "
-                f"highlight_id={feedback.highlight_id} | prompt_version={prompt_version_id}")
-    
-    # Hook online learning updates
-    try:
-        from models import FeedbackType
-        from utils.learning import update_calibration_online, update_prompt_version_metrics_online
-        
-        if highlight_obj:
-            # Update calibration for CONFIDENCE_SCORE feedback
-            if feedback_type == FeedbackType.CONFIDENCE_SCORE.value and confidence_score is not None and highlight_obj.score is not None:
-                await update_calibration_online(
-                    db,
-                    highlight_id=highlight_id,
-                    confidence_score=confidence_score,
-                    predicted_score=highlight_obj.score,
-                )
-            
-            # Update prompt version metrics
-            if highlight_obj.prompt_version_id:
-                await update_prompt_version_metrics_online(
-                    db,
-                    prompt_version_id=highlight_obj.prompt_version_id,
-                    feedback_type=feedback_type,
-                    confidence_score=confidence_score,
-                    is_save=False,
-                )
-    except Exception as e:
-        # Log error but don't fail the feedback creation
-        logger.error(f"Error updating online learning metrics: {str(e)}", exc_info=True)
-    
-    return feedback
-
-
-async def get_feedback_by_highlight_id(db: AsyncSession, highlight_id: UUID) -> List[HighlightFeedback]:
-    result = await db.execute(
-        select(HighlightFeedback)
-        .options(selectinload(HighlightFeedback.highlight))
-        .where(HighlightFeedback.highlight_id == highlight_id)
-        .order_by(HighlightFeedback.created_at.desc())
-    )
-    return list(result.scalars().all())
-
-
-async def get_feedback_stats(db: AsyncSession, highlight_id: UUID) -> dict:
-    feedback_list = await get_feedback_by_highlight_id(db, highlight_id)
-    
-    stats = {
-        "total_feedback": len(feedback_list),
-        "positive_count": 0,
-        "negative_count": 0,
-        "view_count": 0,
-        "skip_count": 0,
-        "share_count": 0,
-        "average_confidence_score": None,
-        "confidence_score_count": 0,
-    }
-    
-    confidence_scores = []
-    for feedback in feedback_list:
-        if feedback.feedback_type == FeedbackType.POSITIVE.value:
-            stats["positive_count"] += 1
-        elif feedback.feedback_type == FeedbackType.NEGATIVE.value:
-            stats["negative_count"] += 1
-        elif feedback.feedback_type == FeedbackType.VIEW.value:
-            stats["view_count"] += 1
-        elif feedback.feedback_type == FeedbackType.SKIP.value:
-            stats["skip_count"] += 1
-        elif feedback.feedback_type == FeedbackType.SHARE.value:
-            stats["share_count"] += 1
-        
-        if feedback.confidence_score is not None:
-            confidence_scores.append(feedback.confidence_score)
-    
-    if confidence_scores:
-        stats["average_confidence_score"] = sum(confidence_scores) / len(confidence_scores)
-        stats["confidence_score_count"] = len(confidence_scores)
-    
-    return stats
-
-
-async def get_recent_feedback(
-    db: AsyncSession,
-    days: int = 7,
-    limit: Optional[int] = None,
-) -> List[HighlightFeedback]:
-    cutoff_date = datetime.utcnow() - timedelta(days=days)
-    query = (
-        select(HighlightFeedback)
-        .options(selectinload(HighlightFeedback.highlight))
-        .where(HighlightFeedback.created_at >= cutoff_date)
-    )
-    if limit:
-        query = query.limit(limit)
-    result = await db.execute(query.order_by(HighlightFeedback.created_at.desc()))
-    return list(result.scalars().all())
 
 
 async def create_prompt_version(
@@ -615,26 +571,6 @@ async def create_saved_moment(
     await db.commit()
     await db.refresh(saved_moment)
     
-    # Hook online learning updates for prompt metrics
-    if highlight_id:
-        try:
-            from utils.learning import update_prompt_version_metrics_online
-            
-            # Load highlight to get prompt_version_id
-            highlight = await db.execute(select(Highlight).where(Highlight.id == highlight_id))
-            highlight_obj = highlight.scalar_one_or_none()
-            
-            if highlight_obj and highlight_obj.prompt_version_id:
-                await update_prompt_version_metrics_online(
-                    db,
-                    prompt_version_id=highlight_obj.prompt_version_id,
-                    feedback_type=None,
-                    rating=None,
-                    is_save=True,
-                )
-        except Exception as e:
-            # Log error but don't fail the save creation
-            logger.error(f"Error updating online learning metrics for save: {str(e)}", exc_info=True)
     
     return saved_moment
 
@@ -658,6 +594,380 @@ async def is_moment_saved(db: AsyncSession, moment_id: UUID) -> bool:
 async def get_all_saved_moments(db: AsyncSession, limit: int = 100, offset: int = 0) -> List[SavedMoment]:
     result = await db.execute(
         select(SavedMoment).limit(limit).offset(offset).order_by(SavedMoment.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def create_video_segment(
+    db: AsyncSession,
+    video_id: UUID,
+    segment_id: int,
+    start_time: float,
+    end_time: float,
+    text: str,
+    label: str,
+    rating: float,
+    grade: str,
+    reason: str,
+    repetition_score: float,
+    filler_density: float,
+    visual_change_score: float,
+    usefulness_score: float,
+    embedding: Optional[List[float]] = None,
+) -> VideoSegment:
+    """Create a video segment analysis record."""
+    segment = VideoSegment(
+        video_id=video_id,
+        segment_id=segment_id,
+        start_time=start_time,
+        end_time=end_time,
+        text=text,
+        label=label,
+        rating=rating,
+        grade=grade,
+        reason=reason,
+        repetition_score=repetition_score,
+        filler_density=filler_density,
+        visual_change_score=visual_change_score,
+        usefulness_score=usefulness_score,
+        embedding=embedding,
+    )
+    db.add(segment)
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+async def create_retention_metrics(
+    db: AsyncSession,
+    video_id: UUID,
+    segment_id: int,
+    time_range: Dict,
+    text: str,
+    metrics: Dict,
+    retention_value: float,
+    decision: Dict,
+) -> "RetentionMetrics":
+    """Create a retention metrics record."""
+    from db.models import RetentionMetrics  # noqa: F401
+    
+    retention_metric = RetentionMetrics(
+        video_id=video_id,
+        segment_id=segment_id,
+        time_range=time_range,
+        text=text,
+        metrics=metrics,
+        retention_value=retention_value,
+        decision=decision,
+    )
+    db.add(retention_metric)
+    await db.commit()
+    await db.refresh(retention_metric)
+    return retention_metric
+
+
+async def get_retention_metrics_by_video(db: AsyncSession, video_id: UUID) -> List["RetentionMetrics"]:
+    """Get all retention metrics for a video."""
+    from db.models import RetentionMetrics
+    
+    result = await db.execute(
+        select(RetentionMetrics)
+        .where(RetentionMetrics.video_id == video_id)
+        .order_by(RetentionMetrics.segment_id)
+    )
+    return list(result.scalars().all())
+
+
+async def get_retention_metrics_by_segment_id(
+    db: AsyncSession,
+    video_id: UUID,
+    segment_id: int,
+) -> Optional["RetentionMetrics"]:
+    """Get retention metrics for a specific segment."""
+    from db.models import RetentionMetrics
+    
+    result = await db.execute(
+        select(RetentionMetrics)
+        .where(RetentionMetrics.video_id == video_id)
+        .where(RetentionMetrics.segment_id == segment_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_video_segments_batch(
+    db: AsyncSession,
+    video_id: UUID,
+    segments_data: List[Dict],
+) -> List[VideoSegment]:
+    """Create multiple video segments in a single batch operation."""
+    segments = []
+    for seg_data in segments_data:
+        segment = VideoSegment(
+            video_id=video_id,
+            segment_id=seg_data["segment_id"],
+            start_time=seg_data["start_time"],
+            end_time=seg_data["end_time"],
+            text=seg_data["text"],
+            label=seg_data["label"],
+            rating=seg_data["rating"],
+            grade=seg_data["grade"],
+            reason=seg_data["reason"],
+            repetition_score=seg_data["repetition_score"],
+            filler_density=seg_data["filler_density"],
+            visual_change_score=seg_data["visual_change_score"],
+            usefulness_score=seg_data["usefulness_score"],
+            embedding=seg_data.get("embedding"),
+        )
+        segments.append(segment)
+        db.add(segment)
+    
+    await db.commit()
+    for segment in segments:
+        await db.refresh(segment)
+    return segments
+
+
+async def create_retention_metrics_batch(
+    db: AsyncSession,
+    video_id: UUID,
+    metrics_data: List[Dict],
+) -> List["RetentionMetrics"]:
+    """Create multiple retention metrics in a single batch operation."""
+    from db.models import RetentionMetrics
+    
+    retention_metrics = []
+    for metric_data in metrics_data:
+        retention_metric = RetentionMetrics(
+            video_id=video_id,
+            segment_id=metric_data["segment_id"],
+            time_range=metric_data["time_range"],
+            text=metric_data["text"],
+            metrics=metric_data["metrics"],
+            retention_value=metric_data["retention_value"],
+            decision=metric_data["decision"],
+        )
+        retention_metrics.append(retention_metric)
+        db.add(retention_metric)
+    
+    await db.commit()
+    for metric in retention_metrics:
+        await db.refresh(metric)
+    return retention_metrics
+
+
+async def get_video_segments(db: AsyncSession, video_id: UUID) -> List[VideoSegment]:
+    """Get all segments for a video."""
+    result = await db.execute(
+        select(VideoSegment)
+        .where(VideoSegment.video_id == video_id)
+        .order_by(VideoSegment.segment_id)
+    )
+    return list(result.scalars().all())
+
+
+async def get_segments_by_label(db: AsyncSession, video_id: UUID, label: str) -> List[VideoSegment]:
+    """Get segments filtered by label (FLUFF)."""
+    result = await db.execute(
+        select(VideoSegment)
+        .where(VideoSegment.video_id == video_id)
+        .where(VideoSegment.label == label)
+        .order_by(VideoSegment.segment_id)
+    )
+    return list(result.scalars().all())
+
+
+async def get_segment_counts_by_label(db: AsyncSession, video_id: UUID) -> dict:
+    """
+    Get segment counts grouped by label using SQL aggregation.
+    
+    This is much more efficient than loading all segments and counting in Python.
+    
+    Returns:
+        Dictionary mapping label to count, e.g., {'FLUFF': 10}
+    """
+    from sqlalchemy import func
+    result = await db.execute(
+        select(VideoSegment.label, func.count(VideoSegment.id))
+        .where(VideoSegment.video_id == video_id)
+        .group_by(VideoSegment.label)
+    )
+    return {row[0]: row[1] for row in result.all()}
+
+
+async def get_video_segment_by_time_range(
+    db: AsyncSession,
+    video_id: UUID,
+    start_time: float,
+    end_time: float,
+    tolerance: float = 0.1,
+) -> Optional[VideoSegment]:
+    """Get a video segment by video_id, start_time, and end_time (with tolerance for floating point comparison)."""
+    result = await db.execute(
+        select(VideoSegment)
+        .where(VideoSegment.video_id == video_id)
+        .where(VideoSegment.start_time >= start_time - tolerance)
+        .where(VideoSegment.start_time <= start_time + tolerance)
+        .where(VideoSegment.end_time >= end_time - tolerance)
+        .where(VideoSegment.end_time <= end_time + tolerance)
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_video_segment_label(
+    db: AsyncSession,
+    video_id: UUID,
+    segment_id: int,
+    new_label: str,
+    new_grade: Optional[str] = None,
+) -> bool:
+    """Update a video segment's label and optionally grade."""
+    update_values = {"label": new_label}
+    if new_grade:
+        update_values["grade"] = new_grade
+    
+    result = await db.execute(
+        update(VideoSegment)
+        .where(VideoSegment.video_id == video_id)
+        .where(VideoSegment.segment_id == segment_id)
+        .values(**update_values)
+    )
+    await db.commit()
+    return result.rowcount > 0
+
+
+async def get_video_segment_by_id(db: AsyncSession, segment_id: UUID) -> Optional[VideoSegment]:
+    """Get a video segment by its ID."""
+    result = await db.execute(select(VideoSegment).where(VideoSegment.id == segment_id))
+    return result.scalar_one_or_none()
+
+
+async def update_video_segment_rating(
+    db: AsyncSession,
+    segment_id: UUID,
+    new_rating: float,
+    new_usefulness_score: Optional[float] = None,
+) -> Optional[VideoSegment]:
+    """Update a video segment's rating and optionally usefulness_score."""
+    update_values = {"rating": max(0.0, min(1.0, new_rating))}
+    if new_usefulness_score is not None:
+        update_values["usefulness_score"] = max(0.0, min(1.0, new_usefulness_score))
+    
+    await db.execute(
+        update(VideoSegment)
+        .where(VideoSegment.id == segment_id)
+        .values(**update_values)
+    )
+    await db.commit()
+    
+    return await get_video_segment_by_id(db, segment_id)
+
+
+async def create_segment_feedback(
+    db: AsyncSession,
+    video_segment_id: UUID,
+    feedback_type: str,
+) -> SegmentFeedback:
+    """Create a segment feedback record."""
+    feedback = SegmentFeedback(
+        video_segment_id=video_segment_id,
+        feedback_type=feedback_type,
+    )
+    db.add(feedback)
+    await db.commit()
+    await db.refresh(feedback)
+    return feedback
+
+
+async def create_or_update_timeline(
+    db: AsyncSession,
+    video_id: UUID,
+    clerk_user_id: Optional[str] = None,
+    project_name: Optional[str] = None,
+    markers: Optional[List] = None,
+    selections: Optional[List] = None,
+    current_time: Optional[float] = None,
+    in_point: Optional[float] = None,
+    out_point: Optional[float] = None,
+    zoom: Optional[float] = None,
+    view_preferences: Optional[Dict] = None,
+) -> Timeline:
+    """Create or update a timeline for a video."""
+    # Get video to access thumbnail
+    video = await get_video_by_id(db, video_id)
+    if not video:
+        raise ValueError(f"Video {video_id} not found")
+    
+    # Check if timeline exists
+    result = await db.execute(select(Timeline).where(Timeline.video_id == video_id))
+    timeline = result.scalar_one_or_none()
+    
+    if timeline:
+        # Update existing timeline
+        if project_name is not None:
+            timeline.project_name = project_name
+        if markers is not None:
+            timeline.markers = markers
+        if selections is not None:
+            timeline.selections = selections
+        if current_time is not None:
+            timeline.current_time = current_time
+        if in_point is not None:
+            timeline.in_point = in_point
+        if out_point is not None:
+            timeline.out_point = out_point
+        if zoom is not None:
+            timeline.zoom = zoom
+        if view_preferences is not None:
+            timeline.view_preferences = view_preferences
+        if clerk_user_id is not None:
+            timeline.clerk_user_id = clerk_user_id
+        # Ensure thumbnail is set (copy from video if missing)
+        if not timeline.thumbnail_path and video.thumbnail_path:
+            timeline.thumbnail_path = video.thumbnail_path
+        timeline.updated_at = datetime.utcnow()
+    else:
+        # Create new timeline - copy thumbnail from video
+        timeline = Timeline(
+            video_id=video_id,
+            clerk_user_id=clerk_user_id,
+            project_name=project_name,
+            markers=markers or [],
+            selections=selections or [],
+            current_time=current_time or 0.0,
+            in_point=in_point,
+            out_point=out_point,
+            zoom=zoom or 1.0,
+            view_preferences=view_preferences or {},
+            thumbnail_path=video.thumbnail_path,  # Copy thumbnail from video
+        )
+        db.add(timeline)
+    
+    await db.commit()
+    await db.refresh(timeline)
+    return timeline
+
+
+async def get_timeline_by_video_id(db: AsyncSession, video_id: UUID) -> Optional[Timeline]:
+    """Get timeline by video ID with video relationship eagerly loaded."""
+    result = await db.execute(
+        select(Timeline)
+        .where(Timeline.video_id == video_id)
+        .options(selectinload(Timeline.video))
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_timelines_by_user(db: AsyncSession, clerk_user_id: Optional[str] = None) -> List[Timeline]:
+    """Get all timelines for a user."""
+    if not clerk_user_id:
+        return []
+    
+    result = await db.execute(
+        select(Timeline)
+        .where(Timeline.clerk_user_id == clerk_user_id)
+        .order_by(Timeline.updated_at.desc())
+        .options(selectinload(Timeline.video).selectinload(Video.moments))
     )
     return list(result.scalars().all())
 

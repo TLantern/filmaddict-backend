@@ -1,105 +1,123 @@
 import asyncio
 import logging
 import os
-import re
 from typing import List
 
-from openai import OpenAI
-from models import TranscriptSegment
+from models import TimelineItem, TranscriptSegment
 
 logger = logging.getLogger(__name__)
 
-_openai_client: OpenAI = None
 
-
-def get_openai_client() -> OpenAI:
-    """Get or create OpenAI client instance."""
-    global _openai_client
-    if _openai_client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required")
-        _openai_client = OpenAI(api_key=api_key)
-    return _openai_client
-
-
-def normalize_text(text: str) -> str:
+def transcribe_audio(audio_path: str) -> List[TimelineItem]:
     """
-    Normalize transcript text by stripping whitespace and fixing spacing.
+    Transcribe audio using Whisper and detect silence segments.
     
-    Args:
-        text: Raw transcript text
-        
-    Returns:
-        Normalized text
-    """
-    text = text.strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def transcribe_audio(audio_path: str) -> List[TranscriptSegment]:
-    """
-    Transcribe audio file using OpenAI Whisper API.
+    This function performs transcription using OpenAI Whisper API, then performs
+    post-processing to detect and insert silence segments between speech segments.
     
     Args:
         audio_path: Full path to the audio file
         
     Returns:
-        List of TranscriptSegment objects with start, end, and text
+        List of TimelineItem objects (union of SpeechSegment and SilenceSegment) 
+        sorted by start time, representing the unified timeline
         
     Raises:
         FileNotFoundError: If audio file doesn't exist
+        ImportError: If Whisper is not available
         Exception: If transcription fails
     """
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
     
-    client = get_openai_client()
-    
     try:
-        logger.info(f"Transcribing audio: {audio_path}")
+        from utils.transcription_whisper import transcribe_with_word_timestamps
+        logger.info(f"📥 Using OpenAI Whisper API transcription for: {audio_path}")
+        words, sentences = transcribe_with_word_timestamps(audio_path)
         
-        with open(audio_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"],
+        # Validate we received data from OpenAI
+        if not sentences:
+            logger.error("❌ OpenAI Whisper API returned no sentences")
+            raise Exception("OpenAI Whisper API returned empty transcription - no sentences found")
+        
+        if not words:
+            logger.error("❌ OpenAI Whisper API returned no words")
+            raise Exception("OpenAI Whisper API returned empty transcription - no words found")
+        
+        logger.info(f"✅ Received {len(words)} words and {len(sentences)} sentences from OpenAI Whisper API")
+        
+        # Convert sentences to TranscriptSegments (existing transcription logic)
+        speech_segments = []
+        for sentence in sentences:
+            if not sentence.text or not sentence.text.strip():
+                logger.warning(f"Skipping empty sentence at {sentence.start:.2f}s-{sentence.end:.2f}s")
+                continue
+            speech_segments.append(TranscriptSegment(
+                start=sentence.start,
+                end=sentence.end,
+                text=sentence.text,
+            ))
+        
+        if not speech_segments:
+            logger.error("❌ No valid transcript segments created from OpenAI transcription")
+            raise Exception("Failed to create transcript segments from OpenAI transcription")
+        
+        logger.info(f"✅ Created {len(speech_segments)} transcript segments from OpenAI Whisper API")
+        logger.debug(f"📝 Sample segment: {speech_segments[0].text[:50]}..." if speech_segments else "No segments")
+        
+        # Post-processing: Detect silence and merge with speech segments
+        try:
+            from utils.silence_detection import detect_silence_segments, merge_transcript_with_silence
+            
+            logger.info(f"🔇 Post-processing: Detecting silence segments...")
+            silence_segments = detect_silence_segments(audio_path)
+            
+            timeline = merge_transcript_with_silence(speech_segments, silence_segments)
+            logger.info(f"✅ Unified timeline created: {len(timeline)} items ({len(speech_segments)} speech + {len(silence_segments)} silence)")
+            
+            return timeline
+            
+        except ImportError as silence_error:
+            # If pydub is not available, log warning and return speech segments only
+            logger.warning(
+                f"⚠️ Silence detection not available (pydub not installed): {silence_error}. "
+                "Returning speech segments only. Install pydub for silence detection."
             )
+            # Convert to TimelineItem format (SpeechSegment)
+            from models import SpeechSegment
+            timeline: List[TimelineItem] = [
+                SpeechSegment(start=seg.start, end=seg.end, text=seg.text)
+                for seg in speech_segments
+            ]
+            return timeline
+        except Exception as silence_error:
+            # If silence detection fails, log error and return speech segments only
+            logger.warning(
+                f"⚠️ Silence detection failed: {silence_error}. "
+                "Returning speech segments only."
+            )
+            from models import SpeechSegment
+            timeline: List[TimelineItem] = [
+                SpeechSegment(start=seg.start, end=seg.end, text=seg.text)
+                for seg in speech_segments
+            ]
+            return timeline
         
-        segments = []
-        if hasattr(transcript, "segments") and transcript.segments:
-            for segment in transcript.segments:
-                normalized_text = normalize_text(segment.text)
-                if normalized_text:
-                    segments.append(
-                        TranscriptSegment(
-                            start=segment.start,
-                            end=segment.end,
-                            text=normalized_text,
-                        )
-                    )
-        else:
-            normalized_text = normalize_text(transcript.text)
-            if normalized_text:
-                segments.append(
-                    TranscriptSegment(
-                        start=0.0,
-                        end=transcript.duration if hasattr(transcript, "duration") else 0.0,
-                        text=normalized_text,
-                    )
-                )
-        
-        logger.info(f"Successfully transcribed audio: {len(segments)} segments")
-        return segments
-        
+    except ImportError as e:
+        error_msg = (
+            "Whisper transcription is not available. "
+            "Install required dependencies: pip install torch torchaudio soundfile\n"
+            "Or use Colab processing by setting COLAB_API_URL environment variable."
+        )
+        logger.error(error_msg)
+        raise ImportError(error_msg) from e
     except Exception as e:
-        logger.error(f"Error transcribing audio: {str(e)}", exc_info=True)
-        raise Exception(f"Failed to transcribe audio: {str(e)}")
+        error_msg = f"Whisper transcription failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise Exception(error_msg) from e
 
 
-async def transcribe_audio_async(audio_path: str) -> List[TranscriptSegment]:
+async def transcribe_audio_async(audio_path: str) -> List[TimelineItem]:
     """
     Async wrapper for transcribe_audio function.
     
@@ -107,7 +125,7 @@ async def transcribe_audio_async(audio_path: str) -> List[TranscriptSegment]:
         audio_path: Full path to the audio file
         
     Returns:
-        List of TranscriptSegment objects
+        List of TimelineItem objects (union of SpeechSegment and SilenceSegment)
     """
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, transcribe_audio, audio_path)

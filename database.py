@@ -19,9 +19,13 @@ if not DATABASE_URL:
 parsed = urlparse(DATABASE_URL)
 query_params = parse_qs(parsed.query)
 
-# Remove sslmode from query params and configure SSL for asyncpg
+# Remove sslmode and channel_binding from query params (asyncpg doesn't support channel_binding)
 ssl_mode = query_params.pop("sslmode", None)
-connect_args = {}
+query_params.pop("channel_binding", None)  # Remove channel_binding as asyncpg doesn't support it
+connect_args = {
+    "command_timeout": 60,  # 60 seconds timeout for commands
+    "timeout": 60,  # Increased from 30 to 60 seconds connection timeout
+}
 if ssl_mode and ssl_mode[0] == "require":
     # Create SSL context that doesn't verify certificates (for Neon/cloud databases)
     ssl_context = ssl.create_default_context()
@@ -48,6 +52,7 @@ engine = create_async_engine(
     max_overflow=20,
     pool_pre_ping=True,
     pool_recycle=3600,
+    pool_timeout=60,  # Increased from 30 to 60 seconds timeout when getting connection from pool
 )
 async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

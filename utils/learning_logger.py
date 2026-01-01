@@ -88,10 +88,8 @@ def log_calibration_change(
     
     log_data["current_changes"].append(change_entry)
     
-    # Move old current changes to previous
-    if len(log_data["current_changes"]) > 100:
-        log_data["previous_changes"].extend(log_data["current_changes"][:-100])
-        log_data["current_changes"] = log_data["current_changes"][-100:]
+    # Cleanup: Keep only the 5 most recent good learning jobs
+    _cleanup_learning_jobs(log_data)
     
     save_log(log_data)
     logger.info(f"Logged calibration change: {change_type} from {previous_offset} to {new_offset}")
@@ -134,10 +132,8 @@ def log_prompt_version_change(
     
     log_data["current_changes"].append(change_entry)
     
-    # Move old current changes to previous
-    if len(log_data["current_changes"]) > 100:
-        log_data["previous_changes"].extend(log_data["current_changes"][:-100])
-        log_data["current_changes"] = log_data["current_changes"][-100:]
+    # Cleanup: Keep only the 5 most recent good learning jobs
+    _cleanup_learning_jobs(log_data)
     
     save_log(log_data)
     logger.info(f"Logged prompt version change: {change_type} for {version_name}")
@@ -168,10 +164,8 @@ def log_feedback_pattern_change(
     
     log_data["current_changes"].append(change_entry)
     
-    # Move old current changes to previous
-    if len(log_data["current_changes"]) > 100:
-        log_data["previous_changes"].extend(log_data["current_changes"][:-100])
-        log_data["current_changes"] = log_data["current_changes"][-100:]
+    # Cleanup: Keep only the 5 most recent good learning jobs
+    _cleanup_learning_jobs(log_data)
     
     save_log(log_data)
     logger.info(f"Logged feedback pattern change: {change_type} with {feedback_count} feedback items")
@@ -292,4 +286,53 @@ def get_recent_changes(limit: int = 20) -> List[Dict[str, Any]]:
     all_changes.extend(log_data.get("current_changes", []))
     
     return sorted(all_changes, key=lambda x: x.get("timestamp", ""), reverse=True)[:limit]
+
+
+def _cleanup_learning_jobs(log_data: Dict[str, Any]):
+    """
+    Cleanup learning jobs: Keep only the 5 most recent good learning jobs.
+    
+    A "good" learning job is one that:
+    - Has type "calibration" or "prompt_version"
+    - Has a successful outcome (not an error)
+    
+    Args:
+        log_data: The learning log data dictionary
+    """
+    # Get all learning-related changes (calibration and prompt_version)
+    all_learning_jobs = []
+    
+    # Collect from current changes
+    for change in log_data.get("current_changes", []):
+        if change.get("type") in ["calibration", "prompt_version"]:
+            all_learning_jobs.append(change)
+    
+    # Collect from previous changes
+    for change in log_data.get("previous_changes", []):
+        if change.get("type") in ["calibration", "prompt_version"]:
+            all_learning_jobs.append(change)
+    
+    # Sort by timestamp (most recent first)
+    all_learning_jobs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    
+    # Keep only the 5 most recent good jobs
+    good_jobs = all_learning_jobs[:5]
+    good_job_timestamps = {job.get("timestamp") for job in good_jobs}
+    
+    # Filter current_changes to keep only good jobs
+    log_data["current_changes"] = [
+        change for change in log_data.get("current_changes", [])
+        if change.get("type") not in ["calibration", "prompt_version"] 
+        or change.get("timestamp") in good_job_timestamps
+    ]
+    
+    # Filter previous_changes to keep only good jobs
+    log_data["previous_changes"] = [
+        change for change in log_data.get("previous_changes", [])
+        if change.get("type") not in ["calibration", "prompt_version"]
+        or change.get("timestamp") in good_job_timestamps
+    ]
+    
+    if len(all_learning_jobs) > 5:
+        logger.info(f"Cleaned up learning jobs: kept {len(good_jobs)} most recent, removed {len(all_learning_jobs) - len(good_jobs)} old jobs")
 

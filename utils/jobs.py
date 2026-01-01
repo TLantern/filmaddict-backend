@@ -24,23 +24,32 @@ async def _process_video_worker() -> None:
     """Background worker that processes videos from the queue."""
     from jobs.process_video import _process_video_async
     
-    logger.info("Video processing worker started")
+    logger.info("✅ Video processing worker started and ready to process videos")
+    logger.info(f"📊 Queue status: {_video_processing_queue.qsize()} items in queue")
+    
     while True:
         try:
+            logger.info("👂 Waiting for videos in queue...")
             video_id = await _video_processing_queue.get()
-            logger.info(f"Processing video from queue: {video_id}")
+            queue_size = _video_processing_queue.qsize()
+            logger.info(f"📥 Received video from queue: {video_id} (remaining in queue: {queue_size})")
+            
             try:
+                logger.info(f"🚀 Starting processing for video: {video_id}")
                 await _process_video_async(video_id)
-                logger.info(f"Successfully processed video: {video_id}")
+                logger.info(f"✅ Successfully processed video: {video_id}")
             except Exception as e:
-                logger.error(f"Error processing video {video_id}: {str(e)}", exc_info=True)
+                logger.error(f"❌ Error processing video {video_id}: {str(e)}", exc_info=True)
             finally:
                 _video_processing_queue.task_done()
+                logger.info(f"✅ Task marked as done for video: {video_id}")
         except asyncio.CancelledError:
-            logger.info("Video processing worker cancelled")
+            logger.info("🛑 Video processing worker cancelled")
             break
         except Exception as e:
-            logger.error(f"Unexpected error in video processing worker: {str(e)}", exc_info=True)
+            logger.error(f"❌ Unexpected error in video processing worker: {str(e)}", exc_info=True)
+            # Continue the loop to avoid worker crash
+            await asyncio.sleep(1)
 
 
 async def start_worker() -> None:
@@ -49,7 +58,21 @@ async def start_worker() -> None:
     if _worker_task is None or _worker_task.done():
         init_task_queue()
         _worker_task = asyncio.create_task(_process_video_worker())
-        logger.info("Video processing worker task started")
+        logger.info("✅ Video processing worker task created and started")
+        
+        # Verify worker is actually running
+        await asyncio.sleep(0.1)  # Give it a moment to start
+        if _worker_task.done():
+            error = _worker_task.exception()
+            if error:
+                logger.error(f"❌ Worker task crashed immediately: {error}", exc_info=error)
+                raise RuntimeError(f"Worker task failed to start: {error}")
+            else:
+                logger.warning("⚠️  Worker task completed immediately (unexpected)")
+        else:
+            logger.info("✅ Worker task is running successfully")
+    else:
+        logger.info("ℹ️  Worker task already running")
 
 
 async def stop_worker() -> None:
@@ -72,8 +95,21 @@ async def enqueue_video_processing(video_id: UUID) -> None:
         video_id: UUID of the video to process
     """
     init_task_queue()
+    
+    # Verify worker is running
+    global _worker_task
+    if _worker_task is None or _worker_task.done():
+        logger.error(f"❌ Worker task is not running! Cannot process video {video_id}")
+        logger.error(f"Worker task status: {_worker_task is None and 'None' or ('Done' if _worker_task.done() else 'Running')}")
+        if _worker_task and _worker_task.done():
+            error = _worker_task.exception()
+            if error:
+                logger.error(f"Worker task had error: {error}", exc_info=error)
+        raise RuntimeError("Video processing worker is not running. Restart the server.")
+    
     await _video_processing_queue.put(video_id)
-    logger.info(f"Enqueued video for processing: {video_id}")
+    queue_size = _video_processing_queue.qsize()
+    logger.info(f"📤 Enqueued video {video_id} for processing (queue size: {queue_size})")
 
 
 async def _learning_worker() -> None:

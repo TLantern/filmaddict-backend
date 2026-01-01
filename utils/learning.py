@@ -99,6 +99,44 @@ async def update_calibration_online(
     return None
 
 
+async def update_segment_calibration_online(
+    db: AsyncSession,
+    segment_id: UUID,
+    predicted_rating: float,
+    actual_rating: float,
+) -> Optional[float]:
+    """
+    Update calibration config online from segment feedback.
+    
+    Args:
+        db: Database session
+        segment_id: Segment ID (for logging)
+        predicted_rating: Original segment rating (0.0-1.0 scale)
+        actual_rating: Adjusted rating after feedback (0.0-1.0 scale)
+        
+    Returns:
+        New calibration offset if sufficient data, None otherwise
+    """
+    # Convert 0.0-1.0 scale to 1-10 scale for calibration
+    predicted_score = predicted_rating * 9.0 + 1.0
+    actual_score = actual_rating * 9.0 + 1.0
+    
+    config = await crud.update_calibration_config_online(
+        db,
+        predicted_score=predicted_score,
+        actual_confidence_score=actual_score,
+    )
+    
+    if config and config.feedback_count >= MIN_FEEDBACK_THRESHOLD:
+        logger.info(
+            f"Updated segment calibration online: segment_id={segment_id}, "
+            f"feedback_count={config.feedback_count}, offset={config.score_offset:.2f}"
+        )
+        return config.score_offset
+    
+    return None
+
+
 async def update_calibration_from_feedback(
     db: AsyncSession,
     days: int = 7,

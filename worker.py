@@ -10,6 +10,9 @@ import multiprocessing
 os.environ['NO_PROXY'] = '*'
 os.environ['no_proxy'] = '*'
 
+# Disable tokenizers parallelism to avoid deadlocks when forking
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 # Fix for Python 3.14 + macOS: use 'spawn' instead of 'fork' to avoid asyncio issues
 if sys.platform == "darwin":
     try:
