@@ -1,5 +1,6 @@
 import logging
 import os
+import subprocess
 import tempfile
 from typing import List, Tuple, Optional
 from uuid import UUID
@@ -85,16 +86,31 @@ def get_keep_segments(
     return keep_segments
 
 
+def _get_ffmpeg_input_kwargs() -> dict:
+    """Get common FFmpeg input kwargs for error tolerance."""
+    return {
+        "err_detect": "ignore_err",
+        "fflags": "+genpts+igndts+discardcorrupt",
+    }
+
+
 def export_mp4(
     video_path: str,
     keep_segments: List[Tuple[float, float]],
     output_path: str,
 ) -> None:
     """Export video as MP4 (H.264)."""
-    if len(keep_segments) == 1:
-        start, end = keep_segments[0]
+    # Filter out invalid segments (too small or invalid times)
+    valid_segments = [(s, e) for s, e in keep_segments if e > s and (e - s) >= 0.1]
+    if not valid_segments:
+        raise ValueError("No valid segments to export")
+    
+    input_kwargs = _get_ffmpeg_input_kwargs()
+    
+    if len(valid_segments) == 1:
+        start, end = valid_segments[0]
         duration = end - start
-        stream = ffmpeg.input(video_path, ss=start, t=duration)
+        stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
         stream = ffmpeg.output(
             stream,
             output_path,
@@ -102,48 +118,94 @@ def export_mp4(
             acodec="aac",
             preset="medium",
             crf=23,
-            **{"movflags": "faststart"},
+            **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
         )
-        ffmpeg.run(stream, overwrite_output=True, quiet=True)
+        ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
     else:
         temp_files = []
+        segment_paths = []
         try:
-            for i, (start, end) in enumerate(keep_segments):
+            for i, (start, end) in enumerate(valid_segments):
                 duration = end - start
+                if duration < 0.1:
+                    logger.warning(f"Skipping segment {i}: duration {duration}s too small")
+                    continue
+                    
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_seg_{i}.mp4")
                 temp_files.append(temp_file.name)
                 temp_file.close()
                 
-                segment_stream = ffmpeg.input(video_path, ss=start, t=duration)
-                segment_stream = ffmpeg.output(
-                    segment_stream,
-                    temp_files[-1],
-                    vcodec="libx264",
-                    acodec="aac",
-                    preset="medium",
-                    crf=23,
-                    **{"movflags": "faststart"},
+                try:
+                    segment_stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
+                    segment_stream = ffmpeg.output(
+                        segment_stream,
+                        temp_files[-1],
+                        vcodec="libx264",
+                        acodec="aac",
+                        preset="medium",
+                        crf=23,
+                        **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
+                    )
+                    # Use subprocess with timeout to prevent hangs (30 seconds per segment max)
+                    segment_timeout = max(30, int(duration * 2))
+                    try:
+                        cmd = ffmpeg.compile(segment_stream, overwrite_output=True)
+                        subprocess.run(
+                            cmd,
+                            capture_output=True,
+                            timeout=segment_timeout,
+                            check=True
+                        )
+                    except subprocess.TimeoutExpired:
+                        logger.warning(f"Segment {i} extraction timed out after {segment_timeout}s, skipping")
+                        continue
+                    except subprocess.CalledProcessError as e:
+                        logger.error(f"Segment {i} extraction failed: {e.stderr.decode() if e.stderr else str(e)}")
+                        continue
+                    
+                    if os.path.exists(temp_files[-1]) and os.path.getsize(temp_files[-1]) > 1000:
+                        segment_paths.append(temp_files[-1])
+                    else:
+                        logger.warning(f"Segment {i} extraction failed or produced empty file")
+                except Exception as e:
+                    logger.error(f"Error extracting segment {i} ({start}-{end}): {str(e)[:200]}")
+                    continue
+            
+            if not segment_paths:
+                raise ValueError("No valid segments were extracted")
+            
+            if len(segment_paths) == 1:
+                # If only one segment, just copy it
+                import shutil
+                shutil.copy2(segment_paths[0], output_path)
+            else:
+                concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+                for segment_path in segment_paths:
+                    concat_file.write(f"file '{segment_path}'\n")
+                concat_file.close()
+                
+                # Use stream copy for concatenation (much faster, no re-encoding)
+                # Segments are already encoded, so we can just copy streams
+                concat_stream = ffmpeg.input(concat_file.name, format='concat', safe=0)
+                concat_stream = ffmpeg.output(
+                    concat_stream,
+                    output_path,
+                    c="copy",  # Stream copy - no re-encoding
+                    movflags="faststart",
                 )
-                ffmpeg.run(segment_stream, overwrite_output=True, quiet=True)
-            
-            concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-            for temp_file in temp_files:
-                concat_file.write(f"file '{temp_file}'\n")
-            concat_file.close()
-            
-            concat_stream = ffmpeg.input(concat_file.name, format='concat', safe=0)
-            concat_stream = ffmpeg.output(
-                concat_stream,
-                output_path,
-                vcodec="libx264",
-                acodec="aac",
-                preset="medium",
-                crf=23,
-                **{"movflags": "faststart"},
-            )
-            ffmpeg.run(concat_stream, overwrite_output=True, quiet=True)
-            
-            os.remove(concat_file.name)
+                # Use subprocess with timeout for concat (120 seconds max for large files)
+                try:
+                    cmd = ffmpeg.compile(concat_stream, overwrite_output=True)
+                    subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+                except subprocess.TimeoutExpired:
+                    logger.error("Concat operation timed out after 120s")
+                    raise Exception("Video concatenation timed out after 120 seconds")
+                except subprocess.CalledProcessError as e:
+                    error_msg = e.stderr.decode() if e.stderr else str(e)
+                    logger.error(f"Concat operation failed: {error_msg}")
+                    raise Exception(f"Video concatenation failed: {error_msg}")
+                
+                os.remove(concat_file.name)
         finally:
             for temp_file in temp_files:
                 if os.path.exists(temp_file):
@@ -161,62 +223,97 @@ def export_mov_prores(
     prores_preset: str = "422",
 ) -> None:
     """Export video as MOV with ProRes codec."""
-    if len(keep_segments) == 1:
-        start, end = keep_segments[0]
+    # Filter out invalid segments (too small or invalid times)
+    valid_segments = [(s, e) for s, e in keep_segments if e > s and (e - s) >= 0.1]
+    if not valid_segments:
+        raise ValueError("No valid segments to export")
+    
+    input_kwargs = _get_ffmpeg_input_kwargs()
+    
+    if len(valid_segments) == 1:
+        start, end = valid_segments[0]
         duration = end - start
-        stream = ffmpeg.input(video_path, ss=start, t=duration)
+        stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
         output_kwargs = {
             "vcodec": prores_profile,
             "acodec": "pcm_s24le",
             "movflags": "faststart",
+            "avoid_negative_ts": "make_zero",
+            "max_muxing_queue_size": "1024",
         }
         if prores_profile == "prores_ks":
             output_kwargs["profile"] = prores_preset
         else:
             output_kwargs[f"{prores_profile}_profile"] = prores_preset
         stream = ffmpeg.output(stream, output_path, **output_kwargs)
-        ffmpeg.run(stream, overwrite_output=True, quiet=True)
+        ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
     else:
         temp_files = []
+        segment_paths = []
         try:
-            for i, (start, end) in enumerate(keep_segments):
+            for i, (start, end) in enumerate(valid_segments):
                 duration = end - start
+                if duration < 0.1:
+                    logger.warning(f"Skipping segment {i}: duration {duration}s too small")
+                    continue
+                    
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_seg_{i}.mov")
                 temp_files.append(temp_file.name)
                 temp_file.close()
                 
-                segment_stream = ffmpeg.input(video_path, ss=start, t=duration)
+                try:
+                    segment_stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
+                    output_kwargs = {
+                        "vcodec": prores_profile,
+                        "acodec": "pcm_s24le",
+                        "movflags": "faststart",
+                        "avoid_negative_ts": "make_zero",
+                        "max_muxing_queue_size": "1024",
+                    }
+                    if prores_profile == "prores_ks":
+                        output_kwargs["profile"] = prores_preset
+                    else:
+                        output_kwargs[f"{prores_profile}_profile"] = prores_preset
+                    segment_stream = ffmpeg.output(segment_stream, temp_files[-1], **output_kwargs)
+                    ffmpeg.run(segment_stream, overwrite_output=True, quiet=True, capture_stderr=True)
+                    
+                    if os.path.exists(temp_files[-1]) and os.path.getsize(temp_files[-1]) > 1000:
+                        segment_paths.append(temp_files[-1])
+                    else:
+                        logger.warning(f"Segment {i} extraction failed or produced empty file")
+                except Exception as e:
+                    logger.error(f"Error extracting segment {i} ({start}-{end}): {str(e)[:200]}")
+                    continue
+            
+            if not segment_paths:
+                raise ValueError("No valid segments were extracted")
+            
+            if len(segment_paths) == 1:
+                # If only one segment, just copy it
+                import shutil
+                shutil.copy2(segment_paths[0], output_path)
+            else:
+                concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+                for segment_path in segment_paths:
+                    concat_file.write(f"file '{segment_path}'\n")
+                concat_file.close()
+                
+                concat_stream = ffmpeg.input(concat_file.name, format='concat', safe=0)
                 output_kwargs = {
                     "vcodec": prores_profile,
                     "acodec": "pcm_s24le",
                     "movflags": "faststart",
+                    "avoid_negative_ts": "make_zero",
+                    "max_muxing_queue_size": "1024",
                 }
                 if prores_profile == "prores_ks":
                     output_kwargs["profile"] = prores_preset
                 else:
                     output_kwargs[f"{prores_profile}_profile"] = prores_preset
-                segment_stream = ffmpeg.output(segment_stream, temp_files[-1], **output_kwargs)
-                ffmpeg.run(segment_stream, overwrite_output=True, quiet=True)
-            
-            concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-            for temp_file in temp_files:
-                concat_file.write(f"file '{temp_file}'\n")
-            concat_file.close()
-            
-            concat_stream = ffmpeg.input(concat_file.name, format='concat', safe=0)
-            output_kwargs = {
-                "vcodec": prores_profile,
-                "acodec": "pcm_s24le",
-                "movflags": "faststart",
-            }
-            if prores_profile == "prores_ks":
-                output_kwargs["profile"] = prores_preset
-            else:
-                output_kwargs[f"{prores_profile}_profile"] = prores_preset
-            concat_stream = ffmpeg.output(concat_stream, output_path, **output_kwargs)
-            ffmpeg.run(concat_stream, overwrite_output=True, quiet=True)
-            
-            os.remove(concat_file.name)
+                concat_stream = ffmpeg.output(concat_stream, output_path, **output_kwargs)
+                ffmpeg.run(concat_stream, overwrite_output=True, quiet=True, capture_stderr=True)
+                
+                os.remove(concat_file.name)
         finally:
             for temp_file in temp_files:
                 if os.path.exists(temp_file):
@@ -232,56 +329,85 @@ def export_webm(
     output_path: str,
 ) -> None:
     """Export video as WebM (VP9)."""
-    if len(keep_segments) == 1:
-        start, end = keep_segments[0]
+    # Filter out invalid segments (too small or invalid times)
+    valid_segments = [(s, e) for s, e in keep_segments if e > s and (e - s) >= 0.1]
+    if not valid_segments:
+        raise ValueError("No valid segments to export")
+    
+    input_kwargs = _get_ffmpeg_input_kwargs()
+    
+    if len(valid_segments) == 1:
+        start, end = valid_segments[0]
         duration = end - start
-        stream = ffmpeg.input(video_path, ss=start, t=duration)
+        stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
         stream = ffmpeg.output(
             stream,
             output_path,
             vcodec="libvpx-vp9",
             acodec="libopus",
             crf=30,
-            b:v=0,
+            **{"b:v": 0, "avoid_negative_ts": "make_zero"},
         )
-        ffmpeg.run(stream, overwrite_output=True, quiet=True)
+        ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
     else:
         temp_files = []
+        segment_paths = []
         try:
-            for i, (start, end) in enumerate(keep_segments):
+            for i, (start, end) in enumerate(valid_segments):
                 duration = end - start
+                if duration < 0.1:
+                    logger.warning(f"Skipping segment {i}: duration {duration}s too small")
+                    continue
+                    
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_seg_{i}.webm")
                 temp_files.append(temp_file.name)
                 temp_file.close()
                 
-                segment_stream = ffmpeg.input(video_path, ss=start, t=duration)
-                segment_stream = ffmpeg.output(
-                    segment_stream,
-                    temp_files[-1],
+                try:
+                    segment_stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
+                    segment_stream = ffmpeg.output(
+                        segment_stream,
+                        temp_files[-1],
+                        vcodec="libvpx-vp9",
+                        acodec="libopus",
+                        crf=30,
+                        **{"b:v": 0, "avoid_negative_ts": "make_zero"},
+                    )
+                    ffmpeg.run(segment_stream, overwrite_output=True, quiet=True, capture_stderr=True)
+                    
+                    if os.path.exists(temp_files[-1]) and os.path.getsize(temp_files[-1]) > 1000:
+                        segment_paths.append(temp_files[-1])
+                    else:
+                        logger.warning(f"Segment {i} extraction failed or produced empty file")
+                except Exception as e:
+                    logger.error(f"Error extracting segment {i} ({start}-{end}): {str(e)[:200]}")
+                    continue
+            
+            if not segment_paths:
+                raise ValueError("No valid segments were extracted")
+            
+            if len(segment_paths) == 1:
+                # If only one segment, just copy it
+                import shutil
+                shutil.copy2(segment_paths[0], output_path)
+            else:
+                concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+                for segment_path in segment_paths:
+                    concat_file.write(f"file '{segment_path}'\n")
+                concat_file.close()
+                
+                concat_stream = ffmpeg.input(concat_file.name, format='concat', safe=0)
+                concat_stream = ffmpeg.output(
+                    concat_stream,
+                    output_path,
                     vcodec="libvpx-vp9",
                     acodec="libopus",
                     crf=30,
-                    b:v=0,
+                    **{"b:v": 0, "avoid_negative_ts": "make_zero"},
                 )
-                ffmpeg.run(segment_stream, overwrite_output=True, quiet=True)
-            
-            concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-            for temp_file in temp_files:
-                concat_file.write(f"file '{temp_file}'\n")
-            concat_file.close()
-            
-            concat_stream = ffmpeg.input(concat_file.name, format='concat', safe=0)
-            concat_stream = ffmpeg.output(
-                concat_stream,
-                output_path,
-                vcodec="libvpx-vp9",
-                acodec="libopus",
-                crf=30,
-                b:v=0,
-            )
-            ffmpeg.run(concat_stream, overwrite_output=True, quiet=True)
-            
-            os.remove(concat_file.name)
+                ffmpeg.run(concat_stream, overwrite_output=True, quiet=True, capture_stderr=True)
+                
+                os.remove(concat_file.name)
         finally:
             for temp_file in temp_files:
                 if os.path.exists(temp_file):
@@ -503,14 +629,69 @@ async def export_video(
         import asyncio
         loop = asyncio.get_event_loop()
         
+        # Calculate timeout based on video duration and segments (allow 10 seconds per segment, minimum 60s)
+        try:
+            probe = ffmpeg.probe(actual_video_path)
+            video_duration = float(probe['format'].get('duration', 0))
+            timeout_seconds = max(60, int(len(keep_segments) * 10) + int(video_duration * 0.1))
+        except:
+            timeout_seconds = max(60, len(keep_segments) * 10)
         if export_format == "mp4":
-            await loop.run_in_executor(None, export_mp4, actual_video_path, keep_segments, output_path)
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, export_mp4, actual_video_path, keep_segments, output_path),
+                    timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"FFmpeg export timed out after {timeout_seconds}s")
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+                raise Exception(f"Video export timed out after {timeout_seconds} seconds")
         elif export_format == "mov_prores422":
-            await loop.run_in_executor(None, export_mov_prores, actual_video_path, keep_segments, output_path, "prores_ks", "422")
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, export_mov_prores, actual_video_path, keep_segments, output_path, "prores_ks", "422"),
+                    timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"FFmpeg export timed out after {timeout_seconds}s")
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+                raise Exception(f"Video export timed out after {timeout_seconds} seconds")
         elif export_format == "mov_prores4444":
-            await loop.run_in_executor(None, export_mov_prores, actual_video_path, keep_segments, output_path, "prores_ks", "4444")
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, export_mov_prores, actual_video_path, keep_segments, output_path, "prores_ks", "4444"),
+                    timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"FFmpeg export timed out after {timeout_seconds}s")
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+                raise Exception(f"Video export timed out after {timeout_seconds} seconds")
         elif export_format == "webm":
-            await loop.run_in_executor(None, export_webm, actual_video_path, keep_segments, output_path)
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, export_webm, actual_video_path, keep_segments, output_path),
+                    timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"FFmpeg export timed out after {timeout_seconds}s")
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+                raise Exception(f"Video export timed out after {timeout_seconds} seconds")
         elif export_format == "xml":
             await loop.run_in_executor(None, export_xml_fcp, actual_video_path, keep_segments, output_path)
         elif export_format == "edl":

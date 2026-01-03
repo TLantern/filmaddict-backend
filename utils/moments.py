@@ -38,6 +38,80 @@ def get_aspect_ratio_filter(aspect_ratio: str) -> Optional[str]:
     return f"crop=ih*{w}/{h}:ih:(iw-ih*{w}/{h})/2:0,scale=1080:-2" if w < h else f"crop=iw:iw*{h}/{w}:0:(ih-iw*{h}/{w})/2,scale=-2:1080"
 
 
+def _run_ffmpeg_with_fallback(video_path: str, temp_moment_path: str, start: float, duration: float, vf_filter: Optional[str] = None) -> None:
+    """
+    Run FFmpeg with copy codec first, then fallback to re-encode if copy fails.
+    Includes error tolerance flags for handling corrupted streams.
+    """
+    # Common input options for error tolerance
+    input_kwargs = {
+        "ss": start,
+        "t": duration,
+        "err_detect": "ignore_err",
+        "fflags": "+genpts+igndts+discardcorrupt",
+    }
+    
+    if vf_filter:
+        # Re-encode with aspect ratio filter (always re-encode for filters)
+        stream = ffmpeg.input(video_path, **input_kwargs)
+        stream = ffmpeg.output(
+            stream,
+            temp_moment_path,
+            vf=vf_filter,
+            vcodec="libx264",
+            acodec="aac",
+            preset="fast",
+            crf=23,
+            **{"movflags": "faststart", "max_muxing_queue_size": "1024"},
+        )
+        ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
+        return
+    
+    # Try copy codec first (faster)
+    try:
+        stream = ffmpeg.input(video_path, **input_kwargs)
+        stream = ffmpeg.output(
+            stream,
+            temp_moment_path,
+            vcodec="copy",
+            acodec="copy",
+            **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
+        )
+        ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
+        
+        # Validate output file is valid (non-zero size and probes successfully)
+        if os.path.exists(temp_moment_path) and os.path.getsize(temp_moment_path) > 1000:
+            try:
+                probe = ffmpeg.probe(temp_moment_path)
+                if probe.get("streams"):
+                    return  # Success with copy
+            except Exception:
+                pass  # Will fallback to re-encode
+        
+        logger.warning("Copy codec produced invalid output, falling back to re-encode")
+    except ffmpeg.Error as e:
+        logger.warning(f"Copy codec failed, falling back to re-encode: {str(e)[:200]}")
+    
+    # Fallback: re-encode for corrupted sources
+    if os.path.exists(temp_moment_path):
+        try:
+            os.remove(temp_moment_path)
+        except:
+            pass
+    
+    stream = ffmpeg.input(video_path, **input_kwargs)
+    stream = ffmpeg.output(
+        stream,
+        temp_moment_path,
+        vcodec="libx264",
+        acodec="aac",
+        preset="fast",
+        crf=23,
+        **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
+    )
+    ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
+
+
 def generate_moment(video_path: str, start: float, end: float, aspect_ratio: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """
     Generate a video moment by trimming a segment from the video using FFmpeg.
@@ -91,33 +165,10 @@ def generate_moment(video_path: str, start: float, end: float, aspect_ratio: Opt
         
         logger.info(f"Generating moment from {video_path} at {start:.2f}s to {end:.2f}s (aspect_ratio={aspect_ratio})")
         
-        stream = ffmpeg.input(video_path, ss=start, t=duration)
+        _run_ffmpeg_with_fallback(video_path, temp_moment_path, start, duration, vf_filter)
         
-        if vf_filter:
-            # Re-encode with aspect ratio filter
-            stream = ffmpeg.output(
-                stream,
-                temp_moment_path,
-                vf=vf_filter,
-                vcodec="libx264",
-                acodec="aac",
-                preset="fast",
-                crf=23,
-                **{"movflags": "faststart"},
-            )
-        else:
-            # Use copy codec for faster extraction (no re-encoding)
-            stream = ffmpeg.output(
-                stream,
-                temp_moment_path,
-                vcodec="copy",
-                acodec="copy",
-                **{"movflags": "faststart", "avoid_negative_ts": "make_zero"},
-            )
-        ffmpeg.run(stream, overwrite_output=True, quiet=True)
-        
-        if not os.path.exists(temp_moment_path):
-            raise Exception(f"Moment generation failed: output file not created")
+        if not os.path.exists(temp_moment_path) or os.path.getsize(temp_moment_path) < 1000:
+            raise Exception(f"Moment generation failed: output file not created or too small")
         
         # Upload to S3 if using S3Storage, otherwise use local path
         if isinstance(storage, S3Storage):
@@ -136,13 +187,13 @@ def generate_moment(video_path: str, start: float, end: float, aspect_ratio: Opt
         
     except ffmpeg.Error as e:
         error_message = e.stderr.decode() if e.stderr else str(e)
-        logger.error(f"FFmpeg error generating moment: {error_message}")
+        logger.error(f"FFmpeg error generating moment: {error_message[:500]}")
         if os.path.exists(temp_moment_path):
             try:
                 os.remove(temp_moment_path)
             except:
                 pass
-        raise Exception(f"Failed to generate moment: {error_message}")
+        raise Exception(f"Failed to generate moment: {error_message[:500]}")
     except Exception as e:
         logger.error(f"Error generating moment: {str(e)}", exc_info=True)
         if os.path.exists(temp_moment_path):

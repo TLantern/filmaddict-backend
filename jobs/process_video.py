@@ -133,43 +133,17 @@ async def _process_video_async(video_id: UUID, clerk_user_id: Optional[str] = No
             )
             sentences_for_highlights.append(sentence)
         
-        # Helper function to generate and save highlights
+        # Helper function to generate highlights (without saving)
         async def generate_highlights():
             try:
                 logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] 🔄 Generating highlights...")
                 highlights = await find_highlights_from_sentences_async(sentences_for_highlights)
                 logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ✅ Found {len(highlights)} highlight candidates")
-                
-                # Aggregate, deduplicate, and rank highlights
-                async with async_session_maker() as db:
-                    final_highlights = await aggregate_and_rank_highlights(
-                        highlights,
-                        max_results=10,
-                        db_session=db
-                    )
-                    logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ✅ Aggregated to {len(final_highlights)} final highlights")
-                    
-                    # Save highlights to database (batch insert for performance)
-                    if final_highlights:
-                        logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] 💾 Saving {len(final_highlights)} highlights to database...")
-                        highlights_data = [
-                            {
-                                "video_id": video_id,
-                                "start": highlight.start,
-                                "end": highlight.end,
-                                "title": highlight.title,
-                                "summary": highlight.summary,
-                                "score": highlight.score,
-                            }
-                            for highlight in final_highlights
-                        ]
-                        await crud.create_highlights_batch(db, highlights_data)
-                        logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ✅ Saved {len(final_highlights)} highlights to database")
-                    else:
-                        logger.warning(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ⚠️  No highlights found to save")
+                return highlights
             except Exception as e:
                 logger.error(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ❌ Failed to generate highlights: {e}", exc_info=True)
                 logger.warning(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ⚠️  Continuing without highlights")
+                return []
         
         # Run fluff detection and highlights generation in parallel
         import asyncio
@@ -181,14 +155,51 @@ async def _process_video_async(video_id: UUID, clerk_user_id: Optional[str] = No
         )
         highlights_task = generate_highlights()
         
-        segment_analyses, _ = await asyncio.gather(fluff_task, highlights_task, return_exceptions=True)
+        segment_analyses, highlight_candidates = await asyncio.gather(fluff_task, highlights_task, return_exceptions=True)
         
         # Handle exceptions
         if isinstance(segment_analyses, Exception):
             logger.error(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ❌ Fluff detection failed: {segment_analyses}", exc_info=True)
             raise segment_analyses
         
-        logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ✅ Fluff detection and highlights generation complete: {len(segment_analyses)} segment analyses")
+        if isinstance(highlight_candidates, Exception):
+            logger.error(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ❌ Highlight generation failed: {highlight_candidates}", exc_info=True)
+            highlight_candidates = []
+        
+        logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ✅ Fluff detection and highlights generation complete: {len(segment_analyses)} segment analyses, {len(highlight_candidates)} highlight candidates")
+        
+        # Trim fluff from highlights and aggregate
+        from models import SegmentAnalysis
+        fluff_segments = [s for s in segment_analyses if s.label == "FLUFF"]
+        
+        if highlight_candidates:
+            async with async_session_maker() as db:
+                final_highlights = await aggregate_and_rank_highlights(
+                    highlight_candidates,
+                    max_results=10,
+                    db_session=db,
+                    fluff_segments=fluff_segments if fluff_segments else None
+                )
+                logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ✅ Aggregated to {len(final_highlights)} final highlights (after fluff trimming)")
+                
+                # Save highlights to database (batch insert for performance)
+                if final_highlights:
+                    logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] 💾 Saving {len(final_highlights)} highlights to database...")
+                    highlights_data = [
+                        {
+                            "video_id": video_id,
+                            "start": highlight.start,
+                            "end": highlight.end,
+                            "title": highlight.title,
+                            "summary": highlight.summary,
+                            "score": highlight.score,
+                        }
+                        for highlight in final_highlights
+                    ]
+                    await crud.create_highlights_batch(db, highlights_data)
+                    logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ✅ Saved {len(final_highlights)} highlights to database")
+                else:
+                    logger.warning(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] ⚠️  No highlights found to save after fluff trimming")
             
         # Store segments in database (batch insert for performance)
         logger.info(f"[ProcessVideo {video_id} (user: {clerk_user_id_local})] 📍 Step 5/5: Saving {len(segment_analyses)} segments to database (batch)...")

@@ -19,8 +19,24 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column('videos', sa.Column('clerk_user_id', sa.String(), nullable=True))
-    op.create_index('idx_videos_clerk_user_id', 'videos', ['clerk_user_id'])
+    # Check if column already exists (idempotent migration)
+    conn = op.get_bind()
+    result = conn.execute(sa.text(
+        "SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'videos' AND column_name = 'clerk_user_id')"
+    ))
+    column_exists = result.scalar()
+    
+    if not column_exists:
+        op.add_column('videos', sa.Column('clerk_user_id', sa.String(), nullable=True))
+    
+    # Check if index exists
+    result = conn.execute(sa.text(
+        "SELECT indexname FROM pg_indexes WHERE tablename = 'videos' AND indexname = 'idx_videos_clerk_user_id'"
+    ))
+    index_exists = result.scalar()
+    
+    if not index_exists:
+        op.create_index('idx_videos_clerk_user_id', 'videos', ['clerk_user_id'])
 
 
 def downgrade() -> None:

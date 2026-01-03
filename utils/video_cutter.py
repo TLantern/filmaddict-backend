@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import tempfile
 import uuid
 from typing import List, Tuple
@@ -14,11 +15,24 @@ from utils.preview_cache import get_preview_file_path, set_preview_path
 
 logger = logging.getLogger(__name__)
 
+# Check if FFmpeg is available
+def check_ffmpeg_available() -> bool:
+    """Check if FFmpeg is installed and available in PATH."""
+    return shutil.which("ffmpeg") is not None
+
+if not check_ffmpeg_available():
+    logger.warning(
+        "FFmpeg not found in PATH. Video cutting will fail. "
+        "Please install FFmpeg and add it to your system PATH. "
+        "Download from: https://ffmpeg.org/download.html"
+    )
+
 
 def cut_segments_from_video(
     video_path: str,
     segments_to_remove: List[Tuple[float, float]],
     output_path: str,
+    use_stream_copy: bool = True,
 ) -> None:
     """
     Cut specified segments from a video using FFmpeg.
@@ -29,11 +43,22 @@ def cut_segments_from_video(
         video_path: Full path to the source video file or HTTP URL (S3 presigned URL)
         segments_to_remove: List of (start_time, end_time) tuples to remove
         output_path: Path where the cut video will be saved
+        use_stream_copy: If True, use fast stream copy (may not be frame-accurate).
+                        If False, re-encode for precise cuts (much slower).
         
     Raises:
         ValueError: If segments are invalid
+        FileNotFoundError: If FFmpeg is not installed or not in PATH
         Exception: If FFmpeg processing fails
     """
+    # Check if FFmpeg is available before attempting to use it
+    if not check_ffmpeg_available():
+        raise FileNotFoundError(
+            "FFmpeg is not installed or not found in PATH. "
+            "Please install FFmpeg from https://ffmpeg.org/download.html "
+            "and add it to your system PATH."
+        )
+    
     # Check if it's a local file path or HTTP URL (S3 presigned URL)
     is_http_url = video_path.startswith("http://") or video_path.startswith("https://")
     
@@ -93,27 +118,43 @@ def cut_segments_from_video(
     if not keep_segments:
         raise ValueError("All video would be removed - cannot create empty video")
     
-    logger.info(f"Cutting video: removing {len(sorted_segments)} segments, keeping {len(keep_segments)} segments")
+    logger.info(f"Cutting video: removing {len(sorted_segments)} segments, keeping {len(keep_segments)} segments (stream_copy={use_stream_copy})")
+    
+    # Common input options for error tolerance
+    input_kwargs = {
+        "err_detect": "ignore_err",
+        "fflags": "+genpts+igndts+discardcorrupt",
+    }
+    
+    # Output options depend on whether we use stream copy or re-encode
+    if use_stream_copy:
+        # Fast: just copy streams (not frame-accurate, but instant)
+        output_kwargs = {
+            "c": "copy",
+            "movflags": "faststart",
+            "avoid_negative_ts": "make_zero",
+        }
+    else:
+        # Slow: re-encode for precise cuts
+        output_kwargs = {
+            "vcodec": "libx264",
+            "acodec": "aac",
+            "preset": "fast",
+            "crf": 23,
+            "movflags": "faststart",
+            "max_muxing_queue_size": "1024",
+        }
     
     try:
         # If only one segment to keep, use simple trim
         if len(keep_segments) == 1:
             start, end = keep_segments[0]
             duration = end - start
-            stream = ffmpeg.input(video_path, ss=start, t=duration)
-            stream = ffmpeg.output(
-                stream,
-                output_path,
-                vcodec="libx264",
-                acodec="aac",
-                preset="fast",
-                crf=23,
-                **{"movflags": "faststart"},
-            )
-            ffmpeg.run(stream, overwrite_output=True, quiet=True)
+            stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
+            stream = ffmpeg.output(stream, output_path, **output_kwargs)
+            ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
         else:
             # Multiple segments - use concat demuxer
-            # Create temporary files for each segment
             temp_files = []
             segment_paths = []
             
@@ -125,20 +166,18 @@ def cut_segments_from_video(
                     temp_file.close()
                     
                     # Extract segment
-                    segment_stream = ffmpeg.input(video_path, ss=start, t=duration)
-                    segment_stream = ffmpeg.output(
-                        segment_stream,
-                        temp_files[-1],
-                        vcodec="libx264",
-                        acodec="aac",
-                        preset="fast",
-                        crf=23,
-                        **{"movflags": "faststart"},
-                    )
-                    ffmpeg.run(segment_stream, overwrite_output=True, quiet=True)
+                    segment_stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
+                    segment_stream = ffmpeg.output(segment_stream, temp_files[-1], **output_kwargs)
+                    ffmpeg.run(segment_stream, overwrite_output=True, quiet=True, capture_stderr=True)
                     
-                    if os.path.exists(temp_files[-1]):
+                    # Validate segment file
+                    if os.path.exists(temp_files[-1]) and os.path.getsize(temp_files[-1]) > 1000:
                         segment_paths.append(temp_files[-1])
+                    else:
+                        logger.warning(f"Segment {i} failed to generate valid output")
+                
+                if not segment_paths:
+                    raise Exception("No valid segments were extracted")
                 
                 # Create concat file
                 concat_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
@@ -146,18 +185,15 @@ def cut_segments_from_video(
                     concat_file.write(f"file '{segment_path}'\n")
                 concat_file.close()
                 
-                # Concatenate segments
+                # Concatenate segments (always use stream copy for concat - segments already processed)
                 concat_stream = ffmpeg.input(concat_file.name, format='concat', safe=0)
                 concat_stream = ffmpeg.output(
                     concat_stream,
                     output_path,
-                    vcodec="libx264",
-                    acodec="aac",
-                    preset="fast",
-                    crf=23,
-                    **{"movflags": "faststart"},
+                    c="copy",
+                    movflags="faststart",
                 )
-                ffmpeg.run(concat_stream, overwrite_output=True, quiet=True)
+                ffmpeg.run(concat_stream, overwrite_output=True, quiet=True, capture_stderr=True)
                 
                 # Clean up concat file
                 if os.path.exists(concat_file.name):
@@ -200,19 +236,34 @@ async def cut_segments_from_video_async(
     video_path: str,
     segments_to_remove: List[Tuple[float, float]],
     output_path: str,
+    use_stream_copy: bool = True,
+    timeout_seconds: int = 120,
 ) -> None:
     """
-    Async wrapper for cut_segments_from_video function.
+    Async wrapper for cut_segments_from_video function with timeout.
+    
+    Args:
+        use_stream_copy: If True (default), use fast stream copy. If False, re-encode.
+        timeout_seconds: Max time to wait (default 120s, should be fast with stream copy)
     """
     import asyncio
+    from functools import partial
+    
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        None,
-        cut_segments_from_video,
-        video_path,
-        segments_to_remove,
-        output_path,
-    )
+    func = partial(cut_segments_from_video, video_path, segments_to_remove, output_path, use_stream_copy)
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, func),
+            timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"FFmpeg timed out after {timeout_seconds}s cutting video")
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except:
+                pass
+        raise Exception(f"Video cutting timed out after {timeout_seconds} seconds")
 
 
 async def process_video_cutting(
@@ -240,7 +291,7 @@ async def process_video_cutting(
     if not video:
         raise ValueError(f"Video not found: {video_id}")
     
-    # Get video path (download if S3)
+    # Get video path (uses cache if available)
     video_path = await get_video_path(video_id, db, download_local=True)
     if not video_path:
         raise ValueError(f"Video file not found: {video_id}")
@@ -253,20 +304,11 @@ async def process_video_cutting(
     temp_output_file.close()
     
     original_storage_path = video.storage_path
-    temp_video_path = None
     new_storage_path = original_storage_path
     
     try:
-        # Download video to temp file if using S3
-        if isinstance(storage, S3Storage) and video_path.startswith("http"):
-            import urllib.request
-            temp_video_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            temp_video_path = temp_video_file.name
-            temp_video_file.close()
-            urllib.request.urlretrieve(video_path, temp_video_path)
-            actual_video_path = temp_video_path
-        else:
-            actual_video_path = video_path
+        # video_path is already local (from cache or local storage)
+        actual_video_path = video_path
         
         # Cut segments from video
         await cut_segments_from_video_async(actual_video_path, segments_to_remove, temp_output_path)
@@ -354,6 +396,13 @@ async def process_video_cutting(
         
         logger.info(f"Successfully cut video {video_id}, new storage path: {new_storage_path}")
         
+        # Clear video cache since video was updated
+        try:
+            from utils.video_cache import clear_cached_video
+            clear_cached_video(video_id)
+        except Exception as e:
+            logger.warning(f"Failed to clear video cache after cutting: {str(e)}")
+        
         # Clean up any orphaned audio files after cutting
         try:
             from utils.audio import cleanup_audio_directory
@@ -365,12 +414,6 @@ async def process_video_cutting(
         
     finally:
         # Clean up temp files
-        if temp_video_path and os.path.exists(temp_video_path):
-            try:
-                os.remove(temp_video_path)
-            except Exception as e:
-                logger.warning(f"Failed to clean up temp video file: {str(e)}")
-        
         if temp_output_path and os.path.exists(temp_output_path):
             try:
                 os.remove(temp_output_path)
@@ -420,41 +463,22 @@ async def generate_local_preview(
             # Local storage - use original path
             return storage.get_video_path(video.storage_path)
     
-    # Get video path (download if S3)
+    # Get video path (uses cache if available)
     video_path = await get_video_path(video_id, db, download_local=True)
     if not video_path:
         raise ValueError(f"Video file not found: {video_id}")
     
-    storage = get_storage_instance()
     preview_path = get_preview_file_path(video_id)
-    temp_video_path = None
     
-    try:
-        # Download video to temp file if using S3 and it's a URL
-        if isinstance(storage, S3Storage) and video_path.startswith("http"):
-            import urllib.request
-            temp_video_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            temp_video_path = temp_video_file.name
-            temp_video_file.close()
-            urllib.request.urlretrieve(video_path, temp_video_path)
-            actual_video_path = temp_video_path
-        else:
-            actual_video_path = video_path
-        
-        # Cut segments from video to preview path
-        await cut_segments_from_video_async(actual_video_path, segments_to_remove, preview_path)
-        
-        # Store preview path in cache
-        set_preview_path(video_id, preview_path)
-        
-        logger.info(f"Generated local preview for video {video_id} at {preview_path}")
-        return preview_path
-        
-    finally:
-        # Clean up temp video file if we downloaded it
-        if temp_video_path and os.path.exists(temp_video_path):
-            try:
-                os.remove(temp_video_path)
-            except Exception as e:
-                logger.warning(f"Failed to clean up temp video file: {str(e)}")
+    # video_path is already local (from cache or local storage)
+    actual_video_path = video_path
+    
+    # Cut segments from video to preview path
+    await cut_segments_from_video_async(actual_video_path, segments_to_remove, preview_path)
+    
+    # Store preview path in cache
+    set_preview_path(video_id, preview_path)
+    
+    logger.info(f"Generated local preview for video {video_id} at {preview_path}")
+    return preview_path
 

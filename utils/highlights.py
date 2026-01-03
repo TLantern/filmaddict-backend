@@ -6,7 +6,7 @@ import re
 from typing import List, Optional
 from uuid import UUID
 
-from models import Highlight, TranscriptChunk, TranscriptSegment, Sentence
+from models import Highlight, TranscriptChunk, TranscriptSegment, Sentence, SegmentAnalysis
 from utils.learning import apply_calibration
 from utils.llm_fallback import get_async_openai_client
 
@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 MIN_CHUNK_SECONDS = 5.0  # Minimum highlight duration
 MAX_CHUNK_SECONDS = 45.0  # Maximum highlight duration
+MAX_CONTEXT_SECONDS = 3.0  # Maximum context to add when trimming fluff
 
 
 def _ends_with_complete_sentence(text: str) -> bool:
@@ -162,6 +163,186 @@ def overlap_percentage(start1: float, end1: float, start2: float, end2: float) -
     overlap_duration = overlap_end - overlap_start
     range1_duration = end1 - start1
     return overlap_duration / range1_duration if range1_duration > 0 else 0.0
+
+
+def _trim_fluff_from_highlight(highlight: Highlight, fluff_segments: List[SegmentAnalysis]) -> Optional[Highlight]:
+    """
+    Trim all fluff from a highlight window.
+    
+    Rules:
+    - Remove all fluff portions from the highlight
+    - Allow max 3s of context only if removal harms payoff (makes highlight too short)
+    - If highlight cannot survive trimming (< MIN_CHUNK_SECONDS), return None
+    
+    Args:
+        highlight: Highlight to trim
+        fluff_segments: List of fluff segments to remove
+        
+    Returns:
+        Trimmed highlight or None if it can't survive trimming
+    """
+    if not fluff_segments:
+        return highlight
+    
+    # Find all fluff segments that overlap with this highlight
+    overlapping_fluff = []
+    for fluff in fluff_segments:
+        if fluff.label == "FLUFF":
+            # Check for overlap
+            if not (fluff.end_time < highlight.start or fluff.start_time > highlight.end):
+                overlapping_fluff.append(fluff)
+    
+    if not overlapping_fluff:
+        return highlight
+    
+    # Sort fluff segments by start time
+    overlapping_fluff.sort(key=lambda f: f.start_time)
+    
+    # Build list of non-fluff intervals by removing fluff portions
+    non_fluff_intervals = []
+    current_start = highlight.start
+    
+    for fluff in overlapping_fluff:
+        fluff_start = max(fluff.start_time, highlight.start)
+        fluff_end = min(fluff.end_time, highlight.end)
+        
+        # If there's content before this fluff segment
+        if current_start < fluff_start:
+            non_fluff_intervals.append((current_start, fluff_start))
+        
+        # Move past this fluff segment
+        current_start = max(current_start, fluff_end)
+    
+    # Add remaining content after last fluff segment
+    if current_start < highlight.end:
+        non_fluff_intervals.append((current_start, highlight.end))
+    
+    if not non_fluff_intervals:
+        # Entire highlight is fluff
+        logger.debug(f"Highlight [{highlight.start:.1f}s-{highlight.end:.1f}s] is entirely fluff, deleting")
+        return None
+    
+    # Merge adjacent intervals (gaps < 0.1s are considered adjacent)
+    merged_intervals = []
+    for interval in non_fluff_intervals:
+        if not merged_intervals:
+            merged_intervals.append(interval)
+        else:
+            last_start, last_end = merged_intervals[-1]
+            current_start, current_end = interval
+            
+            # Merge if gap is small (< 0.1s) or negative (overlap due to rounding)
+            if current_start - last_end < 0.1:
+                merged_intervals[-1] = (last_start, current_end)
+            else:
+                merged_intervals.append(interval)
+    
+    # Find the largest continuous interval
+    if not merged_intervals:
+        return None
+    
+    largest_interval = max(merged_intervals, key=lambda i: i[1] - i[0])
+    trimmed_start, trimmed_end = largest_interval
+    trimmed_duration = trimmed_end - trimmed_start
+    
+    # If trimmed highlight is too short, try adding context (max 3s)
+    if trimmed_duration < MIN_CHUNK_SECONDS:
+        # Calculate how much context we need
+        needed_context = MIN_CHUNK_SECONDS - trimmed_duration
+        
+        # Only add context if it doesn't exceed max (3s) and doesn't exceed original bounds
+        if needed_context <= MAX_CONTEXT_SECONDS:
+            # Try to add context before
+            context_before = min(MAX_CONTEXT_SECONDS / 2, trimmed_start - highlight.start, needed_context / 2)
+            context_after = min(MAX_CONTEXT_SECONDS / 2, highlight.end - trimmed_end, needed_context / 2)
+            
+            # Distribute remaining needed context
+            remaining = needed_context - (context_before + context_after)
+            if remaining > 0:
+                # Try to add more before
+                additional_before = min(remaining, trimmed_start - highlight.start - context_before)
+                context_before += additional_before
+                remaining -= additional_before
+                
+                # Try to add more after
+                if remaining > 0:
+                    additional_after = min(remaining, highlight.end - trimmed_end - context_after)
+                    context_after += additional_after
+            
+            new_start = trimmed_start - context_before
+            new_end = trimmed_end + context_after
+            
+            # Check if adding context introduces fluff
+            # Check if the added context portions overlap with any fluff segments
+            context_has_fluff = False
+            added_before_start = new_start
+            added_before_end = trimmed_start
+            added_after_start = trimmed_end
+            added_after_end = new_end
+            
+            for fluff in fluff_segments:
+                if fluff.label == "FLUFF":
+                    # Check if added context before overlaps with fluff
+                    if not (fluff.end_time < added_before_start or fluff.start_time > added_before_end):
+                        context_has_fluff = True
+                        break
+                    # Check if added context after overlaps with fluff
+                    if not (fluff.end_time < added_after_start or fluff.start_time > added_after_end):
+                        context_has_fluff = True
+                        break
+            
+            if not context_has_fluff and (new_end - new_start) >= MIN_CHUNK_SECONDS:
+                trimmed_start = new_start
+                trimmed_end = new_end
+                trimmed_duration = trimmed_end - trimmed_start
+            else:
+                # Context would introduce fluff or still too short, delete highlight
+                logger.debug(f"Highlight [{highlight.start:.1f}s-{highlight.end:.1f}s] cannot survive trimming (duration {trimmed_duration:.1f}s < {MIN_CHUNK_SECONDS}s), deleting")
+                return None
+        else:
+            # Would need more than 3s context, delete highlight
+            logger.debug(f"Highlight [{highlight.start:.1f}s-{highlight.end:.1f}s] cannot survive trimming (would need {needed_context:.1f}s context > {MAX_CONTEXT_SECONDS}s), deleting")
+            return None
+    
+    # Ensure trimmed highlight is within valid duration range
+    if trimmed_duration < MIN_CHUNK_SECONDS or trimmed_duration > MAX_CHUNK_SECONDS:
+        logger.debug(f"Trimmed highlight [{trimmed_start:.1f}s-{trimmed_end:.1f}s] duration {trimmed_duration:.1f}s outside valid range, deleting")
+        return None
+    
+    # Create trimmed highlight
+    return highlight.model_copy(update={
+        "start": trimmed_start,
+        "end": trimmed_end
+    })
+
+
+def trim_fluff_from_highlights(highlights: List[Highlight], fluff_segments: List[SegmentAnalysis]) -> List[Highlight]:
+    """
+    Trim all fluff from highlight candidate windows.
+    
+    Args:
+        highlights: List of highlights to trim
+        fluff_segments: List of fluff segments to remove
+        
+    Returns:
+        List of trimmed highlights (highlights that couldn't survive trimming are removed)
+    """
+    if not fluff_segments:
+        return highlights
+    
+    trimmed_highlights = []
+    for highlight in highlights:
+        trimmed = _trim_fluff_from_highlight(highlight, fluff_segments)
+        if trimmed:
+            trimmed_highlights.append(trimmed)
+        else:
+            logger.debug(f"Deleted highlight [{highlight.start:.1f}s-{highlight.end:.1f}s] - could not survive fluff trimming")
+    
+    deleted_count = len(highlights) - len(trimmed_highlights)
+    if deleted_count > 0:
+        logger.info(f"Trimmed fluff from {len(highlights)} highlights: {len(trimmed_highlights)} survived, {deleted_count} deleted")
+    
+    return trimmed_highlights
 
 
 def _analyze_chunk_rule_based(chunk: TranscriptChunk) -> List[Highlight]:
@@ -434,7 +615,7 @@ IMPORTANT: Return between 5-10 highlights. Aim for 8-10 if there are enough good
         highlights = []
         valid_timestamps = {(w['start'], w['end']) for w in window_data}
         
-        for h_data in highlights_data[:10]:
+        for h_data in highlights_data:
             try:
                 start = float(h_data.get("start", 0))
                 end = float(h_data.get("end", 0))
@@ -758,7 +939,7 @@ IMPORTANT: Return between 5-10 highlights. Aim for 8-10 if there are enough good
         highlights = []
         valid_timestamps = {(chunk.start, chunk.end) for chunk in valid_chunks}
         
-        for h_data in highlights_data[:10]:  # Limit to max 10
+        for h_data in highlights_data:
             try:
                 start = float(h_data.get("start", 0))
                 end = float(h_data.get("end", 0))
@@ -1091,6 +1272,7 @@ async def aggregate_and_rank_highlights(
     highlights: List[Highlight],
     max_results: int = 10,
     db_session=None,
+    fluff_segments: Optional[List[SegmentAnalysis]] = None,
 ) -> List[Highlight]:
     """
     Aggregate, deduplicate, and rank highlights.
@@ -1098,17 +1280,26 @@ async def aggregate_and_rank_highlights(
     Merges all highlight candidates from all chunks, deduplicates overlapping ranges
     (keeps highest score), sorts by score descending, and truncates to top results.
     Applies calibration offset to scores if calibration is enabled.
+    Trims fluff from highlights if fluff_segments are provided.
     
     Args:
         highlights: List of Highlight objects to process
         max_results: Maximum number of highlights to return (default: 10, minimum: 5)
         db_session: Optional database session for calibration lookup
+        fluff_segments: Optional list of fluff segments to trim from highlights
         
     Returns:
         List of deduplicated and ranked Highlight objects (minimum 5 highlights, or all available if fewer)
     """
     if not highlights:
         return []
+    
+    # Trim fluff from highlights if fluff segments are provided
+    if fluff_segments:
+        highlights = trim_fluff_from_highlights(highlights, fluff_segments)
+        if not highlights:
+            logger.warning("All highlights were removed after fluff trimming")
+            return []
     
     # Ensure max_results is at least 5 (minimum requirement)
     max_results = max(5, max_results)

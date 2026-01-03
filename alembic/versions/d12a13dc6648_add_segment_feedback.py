@@ -19,17 +19,38 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        'segment_feedback',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True, server_default=sa.text('gen_random_uuid()')),
-        sa.Column('video_segment_id', postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column('feedback_type', sa.String(), nullable=False),  # GREAT, FINE, WRONG
-        sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.text('now()')),
-        sa.ForeignKeyConstraint(['video_segment_id'], ['video_segments.id'], ondelete='CASCADE'),
-    )
-    op.create_index('idx_segment_feedback_video_segment_id', 'segment_feedback', ['video_segment_id'])
-    op.create_index('idx_segment_feedback_created_at', 'segment_feedback', ['created_at'])
-    op.create_index('idx_segment_feedback_type', 'segment_feedback', ['feedback_type'])
+    # Check if table already exists (idempotent migration)
+    conn = op.get_bind()
+    result = conn.execute(sa.text(
+        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'segment_feedback')"
+    ))
+    table_exists = result.scalar()
+    
+    if not table_exists:
+        op.create_table(
+            'segment_feedback',
+            sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True, server_default=sa.text('gen_random_uuid()')),
+            sa.Column('video_segment_id', postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column('feedback_type', sa.String(), nullable=False),  # GREAT, FINE, WRONG
+            sa.Column('created_at', sa.DateTime(), nullable=False, server_default=sa.text('now()')),
+            sa.ForeignKeyConstraint(['video_segment_id'], ['video_segments.id'], ondelete='CASCADE'),
+        )
+        op.create_index('idx_segment_feedback_video_segment_id', 'segment_feedback', ['video_segment_id'])
+        op.create_index('idx_segment_feedback_created_at', 'segment_feedback', ['created_at'])
+        op.create_index('idx_segment_feedback_type', 'segment_feedback', ['feedback_type'])
+    else:
+        # Table exists, check and create indexes if missing
+        result = conn.execute(sa.text(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'segment_feedback'"
+        ))
+        existing_indexes = [row[0] for row in result.fetchall()]
+        
+        if 'idx_segment_feedback_video_segment_id' not in existing_indexes:
+            op.create_index('idx_segment_feedback_video_segment_id', 'segment_feedback', ['video_segment_id'])
+        if 'idx_segment_feedback_created_at' not in existing_indexes:
+            op.create_index('idx_segment_feedback_created_at', 'segment_feedback', ['created_at'])
+        if 'idx_segment_feedback_type' not in existing_indexes:
+            op.create_index('idx_segment_feedback_type', 'segment_feedback', ['feedback_type'])
 
 
 def downgrade() -> None:

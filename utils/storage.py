@@ -283,9 +283,62 @@ class S3Storage(StorageInterface):
             local_path = temp_file.name
             temp_file.close()
         
+        # If target file exists and is locked, download to temp file first
+        if os.path.exists(local_path):
+            try:
+                # Try to open file to check if it's accessible
+                with open(local_path, 'rb'):
+                    pass
+                # File exists and is accessible, check if it's valid (has reasonable size)
+                file_size = os.path.getsize(local_path)
+                if file_size >= 10000:  # At least 10KB
+                    logger.info(f"Using existing cached file: {local_path} ({file_size} bytes)")
+                    return local_path
+                else:
+                    logger.warning(f"Cached file {local_path} is too small ({file_size} bytes), re-downloading")
+                    try:
+                        os.remove(local_path)
+                    except:
+                        pass
+            except (PermissionError, IOError):
+                # File is locked, download to temp file first
+                temp_download = tempfile.NamedTemporaryFile(delete=False, suffix=Path(local_path).suffix, dir=os.path.dirname(local_path))
+                temp_path = temp_download.name
+                temp_download.close()
+                
+                try:
+                    self.s3_client.download_file(self.bucket_name, relative_path, temp_path)
+                    # Try to replace locked file
+                    try:
+                        os.remove(local_path)
+                    except PermissionError:
+                        # Still locked, use temp file
+                        logger.warning(f"Cache file {local_path} is locked, using temp file {temp_path}")
+                        return temp_path
+                    
+                    # Move temp to final location
+                    import shutil
+                    shutil.move(temp_path, local_path)
+                    logger.info(f"Downloaded {relative_path} from S3 to {local_path}")
+                    return local_path
+                except Exception as e:
+                    # Clean up temp file on error
+                    try:
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                    except:
+                        pass
+                    raise
+        
         try:
             self.s3_client.download_file(self.bucket_name, relative_path, local_path)
-            logger.info(f"Downloaded {relative_path} from S3 to {local_path}")
+            
+            # Validate downloaded file size
+            file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+            if file_size < 10000:  # Less than 10KB is suspiciously small for a video
+                logger.warning(f"Downloaded file is suspiciously small ({file_size} bytes): {local_path}")
+            
+            logger.info(f"Downloaded {relative_path} from S3 to {local_path} ({file_size} bytes)")
             return local_path
         except ClientError as e:
             logger.error(f"Error downloading {relative_path} from S3: {str(e)}")
@@ -419,13 +472,13 @@ async def get_video_path(video_id: UUID, db: AsyncSession, download_local: bool 
     """
     Get full storage path for a video by ID.
     
-    For S3 storage, downloads the file to a temporary local file if download_local=True
-    (needed for ffmpeg processing). Otherwise returns a presigned URL.
+    For S3 storage, checks cache first, then downloads to cache if needed.
+    Otherwise returns a presigned URL.
     
     Args:
         video_id: UUID of the video
         db: Database session
-        download_local: If True and storage is S3, download to temp file. Default True.
+        download_local: If True and storage is S3, use cache or download to cache. Default True.
         
     Returns:
         Full storage path (local file path or presigned URL) or None if video not found
@@ -439,7 +492,43 @@ async def get_video_path(video_id: UUID, db: AsyncSession, download_local: bool 
     storage = get_storage_instance()
     
     if isinstance(storage, S3Storage) and download_local:
-        return storage.download_to_local(video.storage_path)
+        # Check cache first
+        from utils.video_cache import get_cached_video_path, set_cached_video_path, get_cached_video_file_path
+        cached_path = get_cached_video_path(video_id)
+        if cached_path:
+            return cached_path
+        
+        # Not cached - download to cache
+        cache_path = get_cached_video_file_path(video_id)
+        
+        # Check if file exists but wasn't in cache (might be from previous session)
+        if os.path.exists(cache_path):
+            try:
+                # Try to open file to check if it's accessible and valid
+                with open(cache_path, 'rb'):
+                    pass
+                file_size = os.path.getsize(cache_path)
+                if file_size >= 10000:  # At least 10KB
+                    # File exists and is accessible and valid, use it
+                    set_cached_video_path(video_id, cache_path)
+                    return cache_path
+                else:
+                    # File is too small, remove and re-download
+                    logger.warning(f"Cached file for video {video_id} is too small ({file_size} bytes), re-downloading")
+                    try:
+                        os.remove(cache_path)
+                    except:
+                        pass
+            except (PermissionError, IOError):
+                # File is locked, download_to_local will handle it
+                pass
+        
+        # Download to cache (download_to_local handles locked files)
+        import asyncio
+        loop = asyncio.get_event_loop()
+        actual_path = await loop.run_in_executor(None, storage.download_to_local, video.storage_path, cache_path)
+        set_cached_video_path(video_id, actual_path)
+        return actual_path
     
     return storage.get_video_path(video.storage_path)
 

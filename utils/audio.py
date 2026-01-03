@@ -50,8 +50,14 @@ def extract_audio(video_path: str) -> str:
         # - Use lower bitrate for faster encoding (32k vs 64k - still good for transcription)
         # - Use faster quality setting (q:a 5)
         # - FFmpeg can process HTTP URLs directly without full download
+        # - Error tolerance flags for handling corrupted streams
         
-        stream = ffmpeg.input(video_path)
+        input_kwargs = {
+            "err_detect": "ignore_err",
+            "fflags": "+genpts+igndts+discardcorrupt",
+        }
+        
+        stream = ffmpeg.input(video_path, **input_kwargs)
         stream = ffmpeg.output(
             stream,
             audio_path,
@@ -60,12 +66,12 @@ def extract_audio(video_path: str) -> str:
             ac=1,  # Mono channel
             ar=16000,  # 16kHz sample rate
             audio_bitrate="32k",  # Reduced from 64k to 32k for faster encoding (adequate for transcription)
-            **{'q:a': 5},  # Audio quality level 5 (faster encoding, acceptable quality for transcription)
+            **{'q:a': 5, 'max_muxing_queue_size': '1024'},  # Audio quality level 5 + muxing queue size
         )
-        ffmpeg.run(stream, overwrite_output=True, quiet=True)
+        ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
         
-        if not os.path.exists(audio_path):
-            raise Exception(f"Audio extraction failed: output file not created")
+        if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 100:
+            raise Exception(f"Audio extraction failed: output file not created or too small")
         
         logger.info(f"Successfully extracted audio to: {audio_path}")
         return audio_path

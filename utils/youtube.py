@@ -42,7 +42,7 @@ def get_cookie_config() -> dict:
     Get YouTube cookie configuration from environment variables.
     
     Supports two methods:
-    1. YOUTUBE_COOKIES: Path to a cookies file (Netscape format)
+    1. YOUTUBE_COOKIES: Path to a cookies file (Netscape format) - takes precedence if file exists
     2. YOUTUBE_COOKIES_FROM_BROWSER: Browser name (e.g., "chrome", "firefox", "safari", "edge")
     
     Returns:
@@ -50,17 +50,18 @@ def get_cookie_config() -> dict:
     """
     cookie_config = {}
     
-    # Method 1: Use cookies file
+    # Method 1: Use cookies file (takes precedence if file exists)
     cookies_file = os.getenv("YOUTUBE_COOKIES")
     if cookies_file:
         cookies_path = Path(cookies_file).expanduser()
         if cookies_path.exists():
             cookie_config["cookiefile"] = str(cookies_path)
             logger.info(f"Using cookies file: {cookies_path}")
+            return cookie_config  # Cookies file takes precedence
         else:
             logger.warning(f"Cookies file not found: {cookies_path}")
     
-    # Method 2: Extract cookies from browser (takes precedence if both are set)
+    # Method 2: Extract cookies from browser (fallback if no cookies file)
     browser = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER")
     if browser:
         # Supported browsers: chrome, chromium, firefox, opera, edge, safari, brave, vivaldi
@@ -179,6 +180,17 @@ async def download_youtube_video(
         error_str = str(e)
         logger.warning(f"yt-dlp download error: {error_str}")
         
+        # Provide helpful message for cookie errors
+        if "cookie" in error_str.lower() or "Could not copy Chrome cookie" in error_str:
+            cookie_help = (
+                "Cookie extraction failed. To fix this:\n"
+                "1. Use manual cookie export: Install 'Get cookies.txt LOCALLY' Chrome extension\n"
+                "2. Export cookies from youtube.com and save as youtube_cookies.txt\n"
+                "3. Add YOUTUBE_COOKIES=./youtube_cookies.txt to backend/.env\n"
+                "See backend/COOKIES_SETUP.md for detailed instructions."
+            )
+            logger.error(cookie_help)
+        
         # If postprocessing failed but file might exist, try to find it
         if "Postprocessing" in error_str or "Conversion failed" in error_str:
             match = YOUTUBE_URL_PATTERN.match(url)
@@ -221,6 +233,13 @@ async def download_youtube_video(
                 os.remove(downloaded_file_path)
             except Exception:
                 pass
+        
+        # Enhance error message for cookie issues
+        if "cookie" in error_str.lower() or "Could not copy Chrome cookie" in error_str:
+            raise Exception(
+                f"Failed to download YouTube video: {error_str}\n\n"
+                "Cookie extraction failed. See backend/COOKIES_SETUP.md for setup instructions."
+            )
         raise Exception(f"Failed to download YouTube video: {error_str}")
     except Exception as e:
         logger.error(f"Error downloading YouTube video: {str(e)}", exc_info=True)

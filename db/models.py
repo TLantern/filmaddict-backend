@@ -78,6 +78,7 @@ class Highlight(Base):
     summary = Column(Text, nullable=True)  # 2-3 sentence summary of moment content
     score = Column(Float, nullable=False)
     prompt_version_id = Column(UUID(as_uuid=True), ForeignKey("prompt_versions.id", ondelete="SET NULL"), nullable=True)
+    explanation = Column(JSONB, nullable=True)  # Cached VerdictExplanation as JSON
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     video = relationship("Video", back_populates="highlights")
@@ -262,6 +263,7 @@ class Timeline(Base):
     project_name = Column(String, nullable=True)
     markers = Column(JSONB, nullable=True)
     selections = Column(JSONB, nullable=True)
+    sequences = Column(JSONB, nullable=True)
     current_time = Column(Float, nullable=True, default=0.0)
     in_point = Column(Float, nullable=True)
     out_point = Column(Float, nullable=True)

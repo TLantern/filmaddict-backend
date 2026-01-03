@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import tempfile
@@ -70,8 +71,28 @@ def get_clerk_user_id(x_clerk_user_id: Optional[str] = Header(None, alias="X-Cle
     return x_clerk_user_id
 
 
+def _silence_connection_reset_errors(loop, context):
+    """
+    Custom asyncio exception handler to silence expected connection reset errors.
+    These occur on Windows when clients (browsers) close video streaming connections.
+    """
+    exception = context.get("exception")
+    if isinstance(exception, (ConnectionResetError, ConnectionAbortedError, OSError)):
+        # Check for Windows-specific error codes
+        if hasattr(exception, 'winerror') and exception.winerror in (10054, 10053, 995):
+            return  # Silently ignore - expected during video streaming
+        if isinstance(exception, OSError) and exception.errno in (10054, 10053, 995, 104, 32):
+            return  # Silently ignore
+    # For other exceptions, use default handler
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Set up asyncio exception handler to silence expected connection resets
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(_silence_connection_reset_errors)
+    
     logger.info("Starting FilmAddict Backend")
     logger.info("Initializing database connection")
     async with engine.begin() as conn:
@@ -608,6 +629,50 @@ async def get_video_status(
         raise HTTPException(status_code=500, detail="Internal server error retrieving video status")
 
 
+@app.post("/videos/{video_id}/precache", status_code=200)
+async def precache_video(
+    video_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Pre-download video to local cache for faster editing.
+    Called during timeline load to have video ready before user starts editing.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        video = await crud.get_video_by_id(db, video_uuid)
+        
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Check if already cached
+        from utils.video_cache import get_cached_video_path
+        if get_cached_video_path(video_uuid):
+            return {"status": "already_cached", "video_id": video_id}
+        
+        # Trigger background download
+        async def download_video_to_cache():
+            async with async_session_maker() as bg_db:
+                try:
+                    path = await get_video_path(video_uuid, bg_db, download_local=True)
+                    if path:
+                        logger.info(f"Pre-cached video {video_id} to {path}")
+                except Exception as e:
+                    logger.warning(f"Failed to pre-cache video {video_id}: {e}")
+        
+        background_tasks.add_task(download_video_to_cache)
+        return {"status": "caching_started", "video_id": video_id}
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error starting video precache: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @app.post("/videos/{video_id}/reprocess", status_code=200)
 async def reprocess_video(
     video_id: str,
@@ -677,33 +742,43 @@ async def get_highlights(
         if transcript and transcript.segments:
             transcript_segments = [TranscriptSegment(**seg) for seg in transcript.segments]
         
-        # Generate explanations for highlights using LLM
+        # Generate explanations for highlights using LLM (with caching)
         from utils.explanation_builder import build_highlight_explanation_from_text_async
+        from models import VerdictExplanation
         highlights = []
         for h in highlights_db:
             explanation = None
             try:
-                # Extract text for this highlight segment
-                highlight_text = ""
-                if transcript_segments:
-                    segment_texts = [
-                        seg.text for seg in transcript_segments
-                        if seg.start >= h.start - 0.5 and seg.end <= h.end + 0.5
-                    ]
-                    highlight_text = " ".join(segment_texts)
-                
-                # If no text found, use title as fallback
-                if not highlight_text and h.title:
-                    highlight_text = h.title
-                
-                if highlight_text:
-                    explanation = await build_highlight_explanation_from_text_async(
-                        text=highlight_text,
-                        score=h.score,
-                    )
-                    logger.debug(f"[Backend] Generated explanation for highlight [{h.start:.1f}s-{h.end:.1f}s]: {explanation.confidence} confidence")
+                # Check if explanation is cached in database
+                if h.explanation:
+                    # Use cached explanation
+                    explanation = VerdictExplanation(**h.explanation)
+                    logger.debug(f"[Backend] Using cached explanation for highlight [{h.start:.1f}s-{h.end:.1f}s]")
                 else:
-                    logger.warning(f"[Backend] No transcript text found for highlight [{h.start:.1f}s-{h.end:.1f}s]")
+                    # Generate new explanation and cache it
+                    highlight_text = ""
+                    if transcript_segments:
+                        segment_texts = [
+                            seg.text for seg in transcript_segments
+                            if seg.start >= h.start - 0.5 and seg.end <= h.end + 0.5
+                        ]
+                        highlight_text = " ".join(segment_texts)
+                    
+                    # If no text found, use title as fallback
+                    if not highlight_text and h.title:
+                        highlight_text = h.title
+                    
+                    if highlight_text:
+                        explanation = await build_highlight_explanation_from_text_async(
+                            text=highlight_text,
+                            score=h.score,
+                        )
+                        # Cache the explanation in database
+                        explanation_dict = explanation.model_dump()
+                        await crud.update_highlight_explanation(db, h.id, explanation_dict)
+                        logger.debug(f"[Backend] Generated and cached explanation for highlight [{h.start:.1f}s-{h.end:.1f}s]: {explanation.confidence} confidence")
+                    else:
+                        logger.warning(f"[Backend] No transcript text found for highlight [{h.start:.1f}s-{h.end:.1f}s]")
             except Exception as e:
                 logger.warning(f"[Backend] Failed to generate explanation for highlight [{h.start:.1f}s-{h.end:.1f}s]: {e}", exc_info=True)
                 explanation = None
@@ -1107,7 +1182,6 @@ async def download_video(
         if preview_path:
             # Serve local preview file with range support
             from fastapi.responses import FileResponse
-            range_header = request.headers.get("range")
             return FileResponse(
                 preview_path,
                 media_type="video/mp4",
@@ -1117,20 +1191,27 @@ async def download_video(
         storage = get_storage_instance()
         
         if isinstance(storage, S3Storage):
-            # Stream from S3 through backend to avoid CORS issues
+            # Check for cached video (only exists during active editing)
+            from utils.video_cache import get_cached_video_path
+            cached_path = get_cached_video_path(video_uuid)
+            
+            if cached_path:
+                # Serve from local cache (user is actively editing)
+                from fastapi.responses import FileResponse
+                return FileResponse(
+                    cached_path,
+                    media_type="video/mp4",
+                    headers={"Accept-Ranges": "bytes"},
+                )
+            
+            # No cache - stream from S3 (user navigated away without saving)
             import httpx
-            
             presigned_url = storage.get_video_path(video.storage_path)
-            
-            # Get Range header from request
             range_header = request.headers.get("range")
-            
-            # Prepare headers for S3 request
             headers = {}
             if range_header:
                 headers["Range"] = range_header
             
-            # Stream from S3
             client = None
             stream_ctx = None
             try:
@@ -1143,20 +1224,16 @@ async def download_video(
                     await client.aclose()
                     raise HTTPException(status_code=404, detail="Video file not found in storage")
                 
-                # Handle 416 Range Not Satisfiable - retry without range header
                 if response.status_code == 416:
                     await stream_ctx.__aexit__(None, None, None)
-                    # Retry without range header to get full file
                     stream_ctx = client.stream("GET", presigned_url, follow_redirects=True)
                     response = await stream_ctx.__aenter__()
-                    range_header = None  # Clear range header since we're getting full file
+                    range_header = None
                 
-                # Get content info
                 content_type = response.headers.get("content-type", "video/mp4")
                 content_length = response.headers.get("content-length")
                 content_range = response.headers.get("content-range")
                 
-                # Build response headers
                 response_headers = {
                     "Accept-Ranges": "bytes",
                     "Content-Type": content_type,
@@ -1167,28 +1244,31 @@ async def download_video(
                 if content_range:
                     response_headers["Content-Range"] = content_range
                 
-                # Determine status code
                 status_code = 206 if range_header and response.status_code == 206 else 200
                 
-                # Generator to stream chunks
                 async def generate():
                     try:
                         async for chunk in response.aiter_bytes():
                             yield chunk
-                    except httpx.StreamClosed:
+                    except (httpx.StreamClosed, ConnectionResetError, ConnectionAbortedError, OSError):
                         pass
                     finally:
                         if stream_ctx:
                             try:
                                 await stream_ctx.__aexit__(None, None, None)
+                            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                                pass
                             except Exception:
                                 pass
                         if client:
                             try:
                                 await client.aclose()
+                            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                                pass
                             except Exception:
                                 pass
                 
+                from fastapi.responses import StreamingResponse
                 return StreamingResponse(
                     generate(),
                     status_code=status_code,
@@ -1201,11 +1281,15 @@ async def download_video(
                 if stream_ctx:
                     try:
                         await stream_ctx.__aexit__(None, None, None)
+                    except (ConnectionResetError, ConnectionAbortedError, OSError):
+                        pass
                     except Exception:
                         pass
                 if client:
                     try:
                         await client.aclose()
+                    except (ConnectionResetError, ConnectionAbortedError, OSError):
+                        pass
                     except Exception:
                         pass
                 logger.error(f"Error streaming video from S3: {str(e)}", exc_info=True)
@@ -1317,7 +1401,7 @@ async def download_moment(
                         try:
                             async for chunk in response.aiter_bytes():
                                 yield chunk
-                        except httpx.StreamClosed:
+                        except (httpx.StreamClosed, ConnectionResetError, ConnectionAbortedError, OSError):
                             # Client disconnected or stream closed - this is normal
                             pass
                         finally:
@@ -1325,11 +1409,15 @@ async def download_moment(
                             if stream_ctx:
                                 try:
                                     await stream_ctx.__aexit__(None, None, None)
+                                except (ConnectionResetError, ConnectionAbortedError, OSError):
+                                    pass
                                 except Exception:
                                     pass
                             if client:
                                 try:
                                     await client.aclose()
+                                except (ConnectionResetError, ConnectionAbortedError, OSError):
+                                    pass
                                 except Exception:
                                     pass
                     
@@ -1344,11 +1432,15 @@ async def download_moment(
                     if stream_ctx:
                         try:
                             await stream_ctx.__aexit__(None, None, None)
+                        except (ConnectionResetError, ConnectionAbortedError, OSError):
+                            pass
                         except Exception:
                             pass
                     if client:
                         try:
                             await client.aclose()
+                        except (ConnectionResetError, ConnectionAbortedError, OSError):
+                            pass
                         except Exception:
                             pass
                     raise
@@ -2437,35 +2529,23 @@ async def store_pending_cuts(
         if not new_segments:
             raise HTTPException(status_code=400, detail="No segments to remove")
         
-        # Merge with existing pending cuts (if any)
-        existing_cuts = video.pending_cuts if video.pending_cuts else []
-        merged_cuts = existing_cuts + new_segments
-        
-        # Remove duplicates (same start_time and end_time)
-        seen = set()
-        unique_cuts = []
-        for cut in merged_cuts:
-            key = (cut["start_time"], cut["end_time"])
-            if key not in seen:
-                seen.add(key)
-                unique_cuts.append(cut)
-        
-        # Sort by start_time
-        unique_cuts.sort(key=lambda x: x["start_time"])
+        # Replace pending cuts with the full list from frontend (not merge)
+        # Frontend sends complete gaps list, so we replace entirely
+        unique_cuts = sorted(new_segments, key=lambda x: x["start_time"])
         
         # Store pending cuts
         video.pending_cuts = unique_cuts
         await db.commit()
         
-        # Generate local preview instantly in background (non-blocking)
+        # Generate local preview synchronously so it's ready for playback immediately
         try:
             from utils.video_cutter import generate_local_preview
             segments_to_remove = [(cut["start_time"], cut["end_time"]) for cut in unique_cuts]
-            # Generate preview in background
-            background_tasks.add_task(generate_local_preview, video_uuid, segments_to_remove, db)
-            logger.info(f"Started generating local preview for video {video_uuid}")
+            # Generate preview synchronously (blocking) - user sees cut video immediately
+            await generate_local_preview(video_uuid, segments_to_remove, db)
+            logger.info(f"Generated local preview for video {video_uuid}")
         except Exception as e:
-            logger.warning(f"Failed to schedule local preview generation (non-critical): {str(e)}")
+            logger.warning(f"Failed to generate local preview (will use original video): {str(e)}")
         
         return {
             "status": "success",
@@ -2486,9 +2566,10 @@ async def store_pending_cuts(
 @app.get("/videos/{video_id}/cut", status_code=200)
 async def get_pending_cuts(
     video_id: str,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get pending cuts for a video."""
+    """Get pending cuts for a video. Triggers preview generation if pending cuts exist and no preview is available."""
     try:
         video_uuid = UUID(video_id)
         video = await crud.get_video_by_id(db, video_uuid)
@@ -2496,6 +2577,21 @@ async def get_pending_cuts(
             raise HTTPException(status_code=404, detail="Video not found")
         
         pending_cuts = video.pending_cuts if video.pending_cuts else []
+        
+        # If there are pending cuts, check if preview exists and generate if needed
+        if pending_cuts:
+            from utils.preview_cache import get_preview_path
+            from utils.video_cutter import generate_local_preview
+            
+            preview_path = get_preview_path(video_uuid)
+            if not preview_path:
+                # No preview exists, generate it in background
+                try:
+                    segments_to_remove = [(cut["start_time"], cut["end_time"]) for cut in pending_cuts]
+                    background_tasks.add_task(generate_local_preview, video_uuid, segments_to_remove, db)
+                    logger.info(f"Triggered preview generation for video {video_uuid} on timeline load")
+                except Exception as e:
+                    logger.warning(f"Failed to schedule preview generation on timeline load (non-critical): {str(e)}")
         
         return {
             "status": "success",
@@ -2554,14 +2650,16 @@ async def clear_pending_cuts(
 @app.post("/videos/{video_id}/cut/save", status_code=200)
 async def save_video_cuts(
     video_id: str,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """
     Apply all pending cuts to the video and save.
-    This processes the video cutting and replaces the original video file.
+    Returns immediately - all heavy work (S3 upload, cleanup) runs in background.
+    User continues using local preview until S3 sync completes.
     """
     try:
-        from utils.video_cutter import process_video_cutting
+        from utils.preview_cache import get_preview_path
         
         video_uuid = UUID(video_id)
         video = await crud.get_video_by_id(db, video_uuid)
@@ -2572,83 +2670,95 @@ async def save_video_cuts(
         if not pending_cuts:
             raise HTTPException(status_code=400, detail="No pending cuts to apply")
         
-        # Convert to tuples for processing
         segments_to_remove = [(cut["start_time"], cut["end_time"]) for cut in pending_cuts]
-        
-        # Check if we have a local preview (much faster to upload)
-        from utils.preview_cache import get_preview_path, clear_preview
         preview_path = get_preview_path(video_uuid)
         
-        if preview_path:
-            # Use local preview - upload it to S3 and replace old version
-            logger.info(f"Using local preview for video {video_uuid} from {preview_path}")
-            storage = get_storage_instance()
-            
-            if isinstance(storage, S3Storage):
-                original_storage_path = video.storage_path
-                
-                # Backup old video
-                old_backup_path = original_storage_path.replace("videos/", "videos/backup_")
-                backup_created = False
-                try:
-                    storage.s3_client.copy_object(
-                        Bucket=storage.bucket_name,
-                        CopySource={"Bucket": storage.bucket_name, "Key": original_storage_path},
-                        Key=old_backup_path,
-                    )
-                    logger.info(f"Backed up old video to {old_backup_path}")
-                    backup_created = True
-                except Exception as e:
-                    logger.warning(f"Failed to backup old video (may not exist): {str(e)}")
-                
-                # Upload preview to S3
-                import uuid
-                new_filename = f"{uuid.uuid4()}.mp4"
-                new_storage_path = storage.store_video_from_file(preview_path, new_filename)
-                
-                # Update database
-                video.storage_path = new_storage_path
-                await db.commit()
-                
-                # Delete old video after successful upload
-                try:
-                    storage.delete_video(original_storage_path)
-                    logger.info(f"Deleted old video {original_storage_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete old video: {str(e)}")
-                
-                # Delete backup
-                try:
-                    storage.delete_video(old_backup_path)
-                    logger.info(f"Deleted backup video {old_backup_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete backup video: {str(e)}")
-                
-                # Clear preview cache
-                clear_preview(video_uuid)
-            else:
-                # Local storage - move preview to replace original
-                import shutil
-                old_full_path = storage.get_video_path(video.storage_path)
-                shutil.move(preview_path, old_full_path)
-                clear_preview(video_uuid)
-                new_storage_path = video.storage_path
-        else:
-            # No preview available, process video cutting normally
-            logger.info(f"No local preview found, processing video cutting for {video_uuid}")
-            new_storage_path = await process_video_cutting(video_uuid, segments_to_remove, db)
+        if not preview_path:
+            raise HTTPException(status_code=400, detail="No local preview available. Please apply cuts first.")
         
-        # Refresh video object and clear pending cuts after successful save
-        await db.refresh(video)
+        # === USER-FACING: Just clear pending cuts and return immediately ===
+        # Local preview already exists and is being served to user
         video.pending_cuts = None
         await db.commit()
+        
+        logger.info(f"Save initiated for video {video_uuid} - returning to user, background sync starting")
+        
+        # === BACKGROUND: All heavy work happens here ===
+        async def sync_to_s3_and_cleanup():
+            async with async_session_maker() as bg_db:
+                try:
+                    from utils.preview_cache import get_preview_path, clear_preview
+                    from utils.video_cache import clear_cached_video
+                    import uuid as uuid_lib
+                    
+                    bg_video = await crud.get_video_by_id(bg_db, video_uuid)
+                    if not bg_video:
+                        logger.error(f"[Background] Video {video_uuid} not found")
+                        return
+                    
+                    local_preview = get_preview_path(video_uuid)
+                    if not local_preview:
+                        logger.error(f"[Background] Preview no longer available for {video_uuid}")
+                        return
+                    
+                    storage = get_storage_instance()
+                    original_storage_path = bg_video.storage_path
+                    
+                    if isinstance(storage, S3Storage):
+                        # Upload local preview to S3
+                        new_filename = f"{uuid_lib.uuid4()}.mp4"
+                        new_storage_path = storage.store_video_from_file(local_preview, new_filename)
+                        logger.info(f"[Background] Uploaded new video to S3: {new_storage_path}")
+                        
+                        # Update database with new path
+                        bg_video.storage_path = new_storage_path
+                        await bg_db.commit()
+                        
+                        # Delete old video from S3
+                        try:
+                            storage.delete_video(original_storage_path)
+                            logger.info(f"[Background] Deleted old video {original_storage_path}")
+                        except Exception as e:
+                            logger.warning(f"[Background] Failed to delete old video: {e}")
+                    else:
+                        # Local storage - move preview to replace original
+                        import shutil
+                        old_full_path = storage.get_video_path(bg_video.storage_path)
+                        shutil.copy2(local_preview, old_full_path)
+                        logger.info(f"[Background] Replaced local video file")
+                    
+                    # Clear preview cache (keep serving from new S3 path now)
+                    clear_preview(video_uuid)
+                    
+                    # Delete overlapping segments from DB
+                    try:
+                        deleted_count = await crud.delete_segments_by_time_range(bg_db, video_uuid, segments_to_remove)
+                        logger.info(f"[Background] Deleted {deleted_count} video segments from database")
+                    except Exception as e:
+                        logger.warning(f"[Background] Failed to delete segments: {e}")
+                    
+                    # Update transcript segments
+                    try:
+                        updated = await crud.update_transcript_after_cuts(bg_db, video_uuid, segments_to_remove)
+                        if updated:
+                            logger.info(f"[Background] Updated transcript for video {video_uuid}")
+                    except Exception as e:
+                        logger.warning(f"[Background] Failed to update transcript: {e}")
+                    
+                    # Clear video cache
+                    clear_cached_video(video_uuid)
+                    logger.info(f"[Background] Sync completed for video {video_uuid}")
+                    
+                except Exception as e:
+                    logger.error(f"[Background] Sync error for video {video_uuid}: {e}", exc_info=True)
+        
+        background_tasks.add_task(sync_to_s3_and_cleanup)
         
         return {
             "status": "success",
             "video_id": str(video_uuid),
-            "storage_path": new_storage_path,
             "segments_removed": len(segments_to_remove),
-            "message": "Video cuts saved successfully",
+            "message": "Cuts saved. Syncing to cloud in background.",
         }
     
     except ValueError as e:
@@ -2742,12 +2852,10 @@ async def save_timeline(
     Save timeline state for a video.
     
     Creates or updates a timeline with editing state (markers, selections, etc.).
+    Allows updating existing timelines even if the video no longer exists.
     """
     try:
         video_uuid = UUID(video_id)
-        video = await crud.get_video_by_id(db, video_uuid)
-        if not video:
-            raise HTTPException(status_code=404, detail="Video not found")
         
         timeline = await crud.create_or_update_timeline(
             db=db,
@@ -2756,6 +2864,7 @@ async def save_timeline(
             project_name=request.get("projectName"),
             markers=request.get("markers"),
             selections=request.get("selections"),
+            sequences=request.get("sequences"),
             current_time=request.get("currentTime"),
             in_point=request.get("inPoint"),
             out_point=request.get("outPoint"),
@@ -2771,12 +2880,86 @@ async def save_timeline(
             "timeline_id": str(timeline.id),
         }
     
-    except ValueError:
+    except ValueError as e:
+        error_msg = str(e)
+        if "not found" in error_msg.lower():
+            raise HTTPException(status_code=404, detail=error_msg)
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error saving timeline: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/videos/{video_id}/segments/{segment_id}/keep", status_code=200)
+async def keep_segment(
+    video_id: str,
+    segment_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Mark a FLUFF segment as kept (remove from fluff classification).
+    Changes the segment label from FLUFF to KEEP.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        segment_uuid = UUID(segment_id)
+        
+        # Get segment
+        segment = await crud.get_video_segment_by_id(db, segment_uuid)
+        if not segment:
+            raise HTTPException(status_code=404, detail="Segment not found")
+        
+        # Verify segment belongs to video
+        if segment.video_id != video_uuid:
+            raise HTTPException(status_code=400, detail="Segment does not belong to this video")
+        
+        # Only update if it's currently FLUFF
+        if segment.label != "FLUFF":
+            return {"status": "success", "message": "Segment is not marked as FLUFF"}
+        
+        # Update label to KEEP (removes from fluff classification)
+        # Use update statement directly since we have the segment object
+        from sqlalchemy import update
+        from db.models import VideoSegment
+        await db.execute(
+            update(VideoSegment)
+            .where(VideoSegment.id == segment_uuid)
+            .values(label="KEEP")
+        )
+        await db.commit()
+        
+        logger.info(f"Segment {segment_id} marked as kept (removed from FLUFF)")
+        
+        return {"status": "success", "message": "Segment marked as kept"}
+    
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ID format")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error keeping segment: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.delete("/videos/{video_id}/cache", status_code=200)
+async def clear_video_cache(
+    video_id: str,
+):
+    """
+    Clear the local video cache for a video.
+    Called when user navigates away from timeline without saving.
+    """
+    try:
+        video_uuid = UUID(video_id)
+        from utils.video_cache import clear_cached_video
+        clear_cached_video(video_uuid)
+        return {"status": "success", "message": "Video cache cleared"}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    except Exception as e:
+        logger.error(f"Error clearing video cache: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
@@ -2799,6 +2982,7 @@ async def get_timeline(
                 "project_name": None,
                 "markers": [],
                 "selections": [],
+                "sequences": [],
                 "current_time": 0.0,
                 "in_point": None,
                 "out_point": None,
@@ -2814,6 +2998,7 @@ async def get_timeline(
             "project_name": timeline.project_name,
             "markers": timeline.markers or [],
             "selections": timeline.selections or [],
+            "sequences": timeline.sequences or [],
             "current_time": timeline.current_time or 0.0,
             "in_point": timeline.in_point,
             "out_point": timeline.out_point,

@@ -1,5 +1,5 @@
 import logging
-from typing import List, Optional, Dict, TYPE_CHECKING
+from typing import List, Optional, Dict, Tuple, TYPE_CHECKING
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -65,6 +65,111 @@ async def get_transcript_by_video_id(db: AsyncSession, video_id: UUID) -> Option
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def update_transcript_after_cuts(
+    db: AsyncSession,
+    video_id: UUID,
+    segments_to_remove: List[Tuple[float, float]],
+) -> Optional[Transcript]:
+    """
+    Update transcript segments after video cuts:
+    1. Remove transcript segments that overlap with removed time ranges
+    2. Adjust timestamps of remaining segments to account for cumulative removed time
+    3. Update the transcript in the database
+    4. Clear Redis cache for the transcript
+    
+    Args:
+        db: Database session
+        video_id: UUID of the video
+        segments_to_remove: List of (start_time, end_time) tuples for segments to remove
+        
+    Returns:
+        Updated Transcript object, or None if no transcript exists
+    """
+    if not segments_to_remove:
+        return None
+    
+    # Get current transcript
+    transcript = await get_transcript_by_video_id(db, video_id)
+    if not transcript:
+        logger.warning(f"No transcript found for video {video_id}, skipping transcript update")
+        return None
+    
+    if not transcript.segments:
+        logger.warning(f"Transcript for video {video_id} has no segments, skipping update")
+        return None
+    
+    # Sort removed segments by start time
+    sorted_removed = sorted(segments_to_remove, key=lambda x: x[0])
+    
+    def get_cumulative_removed_time(timestamp: float) -> float:
+        """Calculate cumulative time removed before a given timestamp."""
+        total = 0.0
+        for removed_start, removed_end in sorted_removed:
+            if removed_end <= timestamp:
+                # Entire removed segment is before this timestamp
+                total += removed_end - removed_start
+            elif removed_start < timestamp:
+                # Partial overlap - count only the part before timestamp
+                total += timestamp - removed_start
+        return total
+    
+    # Process transcript segments
+    updated_segments = []
+    segments_removed = 0
+    
+    for segment in transcript.segments:
+        # Check if segment overlaps with any removed time range
+        # A segment overlaps if: start < removed_end AND end > removed_start
+        overlaps = False
+        for removed_start, removed_end in sorted_removed:
+            if segment.get("start", segment.get("start_time", 0)) < removed_end and \
+               segment.get("end", segment.get("end_time", 0)) > removed_start:
+                overlaps = True
+                break
+        
+        if overlaps:
+            segments_removed += 1
+            continue  # Skip segments that overlap with removed ranges
+        
+        # Adjust timestamps by subtracting cumulative removed time
+        old_start = segment.get("start", segment.get("start_time", 0))
+        old_end = segment.get("end", segment.get("end_time", 0))
+        
+        cumulative_before_start = get_cumulative_removed_time(old_start)
+        cumulative_before_end = get_cumulative_removed_time(old_end)
+        
+        new_start = max(0.0, old_start - cumulative_before_start)
+        new_end = max(new_start, old_end - cumulative_before_end)
+        
+        # Create updated segment dict
+        updated_segment = dict(segment)
+        if "start" in updated_segment:
+            updated_segment["start"] = new_start
+        if "start_time" in updated_segment:
+            updated_segment["start_time"] = new_start
+        if "end" in updated_segment:
+            updated_segment["end"] = new_end
+        if "end_time" in updated_segment:
+            updated_segment["end_time"] = new_end
+        
+        updated_segments.append(updated_segment)
+    
+    # Update transcript in database
+    await create_transcript(db, video_id, updated_segments)
+    
+    # Clear Redis cache
+    try:
+        from utils.redis_cache import delete_transcript_from_redis
+        delete_transcript_from_redis(video_id)
+        logger.info(f"Cleared Redis cache for transcript of video {video_id}")
+    except Exception as e:
+        logger.warning(f"Failed to clear Redis cache for transcript: {str(e)}")
+    
+    logger.info(f"Updated transcript for video {video_id}: removed {segments_removed} segments, {len(updated_segments)} segments remaining")
+    
+    return await get_transcript_by_video_id(db, video_id)
 
 
 async def create_highlight(
@@ -555,7 +660,24 @@ async def update_highlight_prompt_version(
         .values(prompt_version_id=prompt_version_id)
     )
     await db.commit()
-    return await db.execute(select(Highlight).where(Highlight.id == highlight_id)).scalar_one_or_none()
+    result = await db.execute(select(Highlight).where(Highlight.id == highlight_id))
+    return result.scalar_one_or_none()
+
+
+async def update_highlight_explanation(
+    db: AsyncSession,
+    highlight_id: UUID,
+    explanation: dict,
+) -> Optional[Highlight]:
+    """Update the cached explanation for a highlight."""
+    await db.execute(
+        update(Highlight)
+        .where(Highlight.id == highlight_id)
+        .values(explanation=explanation)
+    )
+    await db.commit()
+    result = await db.execute(select(Highlight).where(Highlight.id == highlight_id))
+    return result.scalar_one_or_none()
 
 
 async def create_saved_moment(
@@ -863,6 +985,52 @@ async def update_video_segment_rating(
     return await get_video_segment_by_id(db, segment_id)
 
 
+async def delete_segments_by_time_range(
+    db: AsyncSession,
+    video_id: UUID,
+    segments_to_remove: List[Tuple[float, float]],
+) -> int:
+    """
+    Delete VideoSegment records that overlap with any of the removed time ranges.
+    
+    Args:
+        db: Database session
+        video_id: UUID of the video
+        segments_to_remove: List of (start_time, end_time) tuples for segments to remove
+        
+    Returns:
+        Number of segments deleted
+    """
+    if not segments_to_remove:
+        return 0
+    
+    from sqlalchemy import or_
+    
+    # Build OR conditions for overlapping segments
+    # A segment overlaps if: start_time < removed_end AND end_time > removed_start
+    conditions = []
+    for removed_start, removed_end in segments_to_remove:
+        conditions.append(
+            (VideoSegment.start_time < removed_end) & (VideoSegment.end_time > removed_start)
+        )
+    
+    # Combine all conditions with OR
+    combined_condition = or_(*conditions)
+    
+    # Delete segments that match any condition
+    result = await db.execute(
+        delete(VideoSegment)
+        .where(VideoSegment.video_id == video_id)
+        .where(combined_condition)
+    )
+    await db.commit()
+    
+    deleted_count = result.rowcount
+    logger.info(f"Deleted {deleted_count} video segments for video {video_id} that overlapped with removed time ranges")
+    
+    return deleted_count
+
+
 async def create_segment_feedback(
     db: AsyncSession,
     video_segment_id: UUID,
@@ -886,6 +1054,7 @@ async def create_or_update_timeline(
     project_name: Optional[str] = None,
     markers: Optional[List] = None,
     selections: Optional[List] = None,
+    sequences: Optional[List] = None,
     current_time: Optional[float] = None,
     in_point: Optional[float] = None,
     out_point: Optional[float] = None,
@@ -893,23 +1062,20 @@ async def create_or_update_timeline(
     view_preferences: Optional[Dict] = None,
 ) -> Timeline:
     """Create or update a timeline for a video."""
-    # Get video to access thumbnail
-    video = await get_video_by_id(db, video_id)
-    if not video:
-        raise ValueError(f"Video {video_id} not found")
-    
-    # Check if timeline exists
+    # Check if timeline exists first
     result = await db.execute(select(Timeline).where(Timeline.video_id == video_id))
     timeline = result.scalar_one_or_none()
     
     if timeline:
-        # Update existing timeline
+        # Update existing timeline - allow even if video doesn't exist
         if project_name is not None:
             timeline.project_name = project_name
         if markers is not None:
             timeline.markers = markers
         if selections is not None:
             timeline.selections = selections
+        if sequences is not None:
+            timeline.sequences = sequences
         if current_time is not None:
             timeline.current_time = current_time
         if in_point is not None:
@@ -922,24 +1088,30 @@ async def create_or_update_timeline(
             timeline.view_preferences = view_preferences
         if clerk_user_id is not None:
             timeline.clerk_user_id = clerk_user_id
-        # Ensure thumbnail is set (copy from video if missing)
-        if not timeline.thumbnail_path and video.thumbnail_path:
+        # Try to get video to update thumbnail if missing
+        video = await get_video_by_id(db, video_id)
+        if video and not timeline.thumbnail_path and video.thumbnail_path:
             timeline.thumbnail_path = video.thumbnail_path
         timeline.updated_at = datetime.utcnow()
     else:
-        # Create new timeline - copy thumbnail from video
+        # Create new timeline - video must exist
+        video = await get_video_by_id(db, video_id)
+        if not video:
+            raise ValueError(f"Video with id {video_id} not found")
+        
         timeline = Timeline(
             video_id=video_id,
             clerk_user_id=clerk_user_id,
             project_name=project_name,
             markers=markers or [],
             selections=selections or [],
+            sequences=sequences or [],
             current_time=current_time or 0.0,
             in_point=in_point,
             out_point=out_point,
             zoom=zoom or 1.0,
             view_preferences=view_preferences or {},
-            thumbnail_path=video.thumbnail_path,  # Copy thumbnail from video
+            thumbnail_path=video.thumbnail_path if video else None,
         )
         db.add(timeline)
     
