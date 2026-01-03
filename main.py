@@ -611,6 +611,7 @@ async def get_video_status(
             status=VideoStatus(video.status),
             duration=video.duration,
             created_at=video.created_at,
+            error_message=video.error_message,
         )
     
     except ValueError:

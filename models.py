@@ -243,6 +243,7 @@ class VideoStatusResponse(BaseModel):
     status: VideoStatus
     duration: Optional[float] = Field(None, ge=0, description="Duration in seconds")
     created_at: datetime
+    error_message: Optional[str] = Field(None, description="Error message if processing failed")
 
     model_config = ConfigDict(
         json_encoders={UUID: str},

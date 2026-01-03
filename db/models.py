@@ -37,6 +37,7 @@ class Video(Base):
     pending_cuts = Column(JSONB, nullable=True)  # List of {start_time, end_time} segments to remove
     clerk_user_id = Column(String, nullable=True, index=True)  # Clerk user ID for user-based filtering
     thumbnail_path = Column(String, nullable=True)  # Path to thumbnail image in storage
+    error_message = Column(Text, nullable=True)  # Error message if processing failed
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 

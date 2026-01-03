@@ -32,8 +32,11 @@ async def get_video_by_id(db: AsyncSession, video_id: UUID) -> Optional[Video]:
     return result.scalar_one_or_none()
 
 
-async def update_video_status(db: AsyncSession, video_id: UUID, status: VideoStatus) -> Optional[Video]:
-    await db.execute(update(Video).where(Video.id == video_id).values(status=status.value))
+async def update_video_status(db: AsyncSession, video_id: UUID, status: VideoStatus, error_message: Optional[str] = None) -> Optional[Video]:
+    update_values = {"status": status.value}
+    if error_message is not None:
+        update_values["error_message"] = error_message
+    await db.execute(update(Video).where(Video.id == video_id).values(**update_values))
     await db.commit()
     return await get_video_by_id(db, video_id)
 

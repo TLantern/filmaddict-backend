@@ -339,11 +339,14 @@ async def _process_video_async(video_id: UUID, clerk_user_id: Optional[str] = No
             #     logger.warning(f"Learning pipeline failed (non-blocking): {str(e)}", exc_info=True)
     
     except Exception as e:
-        logger.error(f"Error processing video {video_id} (user_id: {clerk_user_id_local}): {str(e)}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"Error processing video {video_id} (user_id: {clerk_user_id_local}): {error_msg}", exc_info=True)
         # Use separate session for error handling to ensure status update succeeds
         try:
             async with async_session_maker() as error_db:
-                await crud.update_video_status(error_db, video_id, VideoStatus.FAILED)
+                # Truncate error message to 1000 chars to avoid database issues
+                truncated_error = error_msg[:1000] if len(error_msg) > 1000 else error_msg
+                await crud.update_video_status(error_db, video_id, VideoStatus.FAILED, error_message=truncated_error)
         except Exception as db_error:
             logger.error(f"Failed to update status to FAILED: {str(db_error)}", exc_info=True)
         raise
