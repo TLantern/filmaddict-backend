@@ -111,12 +111,46 @@ def export_mp4(
         start, end = valid_segments[0]
         duration = end - start
         stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
+        
+        # Try stream copy first (much faster, no re-encoding)
+        try:
+            stream = ffmpeg.output(
+                stream,
+                output_path,
+                vcodec="copy",  # Changed from "libx264"
+                acodec="copy",  # Changed from "aac"
+                **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
+            )
+            ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
+            
+            # Validate output
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                try:
+                    probe = ffmpeg.probe(output_path)
+                    if probe.get("streams"):
+                        return  # Success with copy
+                except Exception:
+                    pass
+            
+            # If copy failed, remove and re-encode
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception as e:
+            logger.debug(f"Stream copy failed, re-encoding: {str(e)[:200]}")
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+        
+        # Fallback: re-encode with fast preset for speed
+        stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
         stream = ffmpeg.output(
             stream,
             output_path,
             vcodec="libx264",
             acodec="aac",
-            preset="medium",
+            preset="fast",  # Changed from "medium"
             crf=23,
             **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
         )
@@ -136,18 +170,53 @@ def export_mp4(
                 temp_file.close()
                 
                 try:
+                    # Try stream copy first (much faster)
+                    segment_stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
+                    segment_stream = ffmpeg.output(
+                        segment_stream,
+                        temp_files[-1],
+                        vcodec="copy",  # Changed from "libx264"
+                        acodec="copy",  # Changed from "aac"
+                        **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
+                    )
+                    segment_timeout = max(10, int(duration * 0.5))  # Changed from max(30, int(duration * 2))
+                    try:
+                        cmd = ffmpeg.compile(segment_stream, overwrite_output=True)
+                        subprocess.run(cmd, capture_output=True, timeout=segment_timeout, check=True)
+                        
+                        # Validate output
+                        if os.path.exists(temp_files[-1]) and os.path.getsize(temp_files[-1]) > 1000:
+                            try:
+                                probe = ffmpeg.probe(temp_files[-1])
+                                if probe.get("streams"):
+                                    segment_paths.append(temp_files[-1])
+                                    continue  # Success with copy
+                            except Exception:
+                                pass
+                        
+                        # If copy failed, remove and re-encode
+                        if os.path.exists(temp_files[-1]):
+                            os.remove(temp_files[-1])
+                    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+                        # Fallback to re-encode
+                        if os.path.exists(temp_files[-1]):
+                            try:
+                                os.remove(temp_files[-1])
+                            except:
+                                pass
+                    
+                    # Fallback: re-encode with fast preset
                     segment_stream = ffmpeg.input(video_path, ss=start, t=duration, **input_kwargs)
                     segment_stream = ffmpeg.output(
                         segment_stream,
                         temp_files[-1],
                         vcodec="libx264",
                         acodec="aac",
-                        preset="medium",
+                        preset="fast",  # Changed from "medium"
                         crf=23,
                         **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
                     )
-                    # Use subprocess with timeout to prevent hangs (30 seconds per segment max)
-                    segment_timeout = max(30, int(duration * 2))
+                    segment_timeout = max(30, int(duration * 2))  # Kept same for re-encoding
                     try:
                         cmd = ffmpeg.compile(segment_stream, overwrite_output=True)
                         subprocess.run(
@@ -575,7 +644,7 @@ async def export_video(
         video_id: UUID of the video to export
         export_format: Format key (mp4, mov_prores422, mov_prores4444, webm, xml, edl, aaf)
         segments_to_remove: Optional list of (start, end) tuples to remove
-        db: Database session (required)
+        db: Database session (optional - will create its own if None)
         
     Returns:
         Tuple of (output_file_path, mime_type)
@@ -585,16 +654,31 @@ async def export_video(
     
     format_info = EXPORT_FORMATS[export_format]
     
+    # Create short-lived session if not provided
+    from database import async_session_maker
     if db is None:
-        raise ValueError("Database session is required")
-    
-    video = await crud.get_video_by_id(db, video_id)
-    if not video:
-        raise ValueError(f"Video not found: {video_id}")
-    
-    video_path = await get_video_path(video_id, db, download_local=True)
-    if not video_path:
-        raise ValueError(f"Video file not found: {video_id}")
+        async with async_session_maker() as db:
+            video = await crud.get_video_by_id(db, video_id)
+            if not video:
+                raise ValueError(f"Video not found: {video_id}")
+            
+            video_path = await get_video_path(video_id, db, download_local=True)
+            if not video_path:
+                raise ValueError(f"Video file not found: {video_id}")
+            
+            # Store video data before session closes
+            pending_cuts = video.pending_cuts if video.pending_cuts else None
+    else:
+        video = await crud.get_video_by_id(db, video_id)
+        if not video:
+            raise ValueError(f"Video not found: {video_id}")
+        
+        video_path = await get_video_path(video_id, db, download_local=True)
+        if not video_path:
+            raise ValueError(f"Video file not found: {video_id}")
+        
+        # Store video data before session closes
+        pending_cuts = video.pending_cuts if video.pending_cuts else None
     
     if isinstance(get_storage_instance(), S3Storage) and video_path.startswith("http"):
         import urllib.request
@@ -610,10 +694,10 @@ async def export_video(
     try:
         if segments_to_remove is None:
             segments_to_remove = []
-            if video.pending_cuts:
+            if pending_cuts:
                 segments_to_remove = [
                     (cut["start_time"], cut["end_time"])
-                    for cut in video.pending_cuts
+                    for cut in pending_cuts
                 ]
         
         keep_segments = get_keep_segments(actual_video_path, segments_to_remove)
@@ -629,13 +713,22 @@ async def export_video(
         import asyncio
         loop = asyncio.get_event_loop()
         
-        # Calculate timeout based on video duration and segments (allow 10 seconds per segment, minimum 60s)
+        # Calculate timeout based on video duration and segments
+        # Stream copy is much faster, so timeouts are more conservative
+        # Minimum 2 minutes, maximum 1 hour for very long videos
         try:
             probe = ffmpeg.probe(actual_video_path)
             video_duration = float(probe['format'].get('duration', 0))
-            timeout_seconds = max(60, int(len(keep_segments) * 10) + int(video_duration * 0.1))
+            # Stream copy is fast: 5s per segment + 0.1x duration
+            # Re-encoding fallback: 15s per segment + 0.3x duration
+            base_timeout = int(len(keep_segments) * 15) + int(video_duration * 0.3)
+            # For ProRes formats, add extra time (they're more CPU-intensive)
+            if export_format in ["mov_prores422", "mov_prores4444"]:
+                base_timeout = int(base_timeout * 2)  # ProRes always re-encodes
+            timeout_seconds = max(120, min(base_timeout, 3600))  # 2 min to 1 hour
         except:
-            timeout_seconds = max(60, len(keep_segments) * 10)
+            # Fallback: 15s per segment, minimum 2 minutes
+            timeout_seconds = max(120, len(keep_segments) * 15)
         if export_format == "mp4":
             try:
                 await asyncio.wait_for(

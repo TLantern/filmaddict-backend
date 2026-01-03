@@ -1177,6 +1177,11 @@ async def download_video(
         if not video:
             raise HTTPException(status_code=404, detail="Video not found")
         
+        # Store video data before closing session
+        storage_path = video.storage_path
+        # Close DB session immediately - we don't need it during streaming
+        await db.close()
+        
         # Check for local preview first (instant preview with cuts)
         from utils.preview_cache import get_preview_path
         preview_path = get_preview_path(video_uuid)
@@ -1207,7 +1212,7 @@ async def download_video(
             
             # No cache - stream from S3 (user navigated away without saving)
             import httpx
-            presigned_url = storage.get_video_path(video.storage_path)
+            presigned_url = storage.get_video_path(storage_path)
             range_header = request.headers.get("range")
             headers = {}
             if range_header:
@@ -1297,7 +1302,7 @@ async def download_video(
                 raise HTTPException(status_code=500, detail="Error accessing video file")
         else:
             # Local file - use FileResponse which handles Range requests
-            local_path = storage.get_video_path(video.storage_path)
+            local_path = storage.get_video_path(storage_path)
             if not os.path.exists(local_path):
                 raise HTTPException(status_code=404, detail="Video file not found on disk")
             return FileResponse(
@@ -1338,13 +1343,18 @@ async def download_moment(
         if not moment:
             raise HTTPException(status_code=404, detail="Moment not found")
         
+        # Store moment data before closing session
+        moment_storage_path = moment.storage_path
+        # Close DB session immediately - we don't need it during streaming
+        await db.close()
+        
         storage = get_storage_instance()
         
         # Handle S3 storage - proxy the video to avoid CORS issues
         if isinstance(storage, S3Storage):
             try:
                 import httpx
-                presigned_url = storage.get_video_path(moment.storage_path)
+                presigned_url = storage.get_video_path(moment_storage_path)
                 
                 # Get range header if present (for video seeking)
                 range_header = None
@@ -1454,7 +1464,7 @@ async def download_moment(
         
         # Handle local storage
         upload_dir = os.getenv("UPLOAD_DIR", "./uploads")
-        moment_full_path = os.path.join(upload_dir, moment.storage_path)
+        moment_full_path = os.path.join(upload_dir, moment_storage_path)
         
         if not os.path.exists(moment_full_path):
             logger.error(f"Moment file not found at path: {moment_full_path}")
@@ -2808,11 +2818,13 @@ async def export_video(
                 for seg in request.segments_to_remove
             ]
         
+        # Close DB session early - export_video_func will create its own short-lived session
+        await db.close()
         output_path, mime_type = await export_video_func(
             video_uuid,
             request.format,
             segments_to_remove,
-            db
+            None  # Changed from db to None
         )
         
         format_info = EXPORT_FORMATS[request.format]
