@@ -311,6 +311,12 @@ class ExportVideoRequest(BaseModel):
     segments_to_remove: Optional[List[dict]] = Field(None, description="Optional list of {start_time, end_time} segments to remove")
 
 
+class ExportHighlightRequest(BaseModel):
+    start_time: float = Field(..., ge=0, description="Start time in seconds")
+    end_time: float = Field(..., ge=0, description="End time in seconds")
+    aspect_ratio: str = Field(..., description="Aspect ratio: 9:16, 1:1, or 16:9")
+
+
 @app.post("/videos/upload", status_code=201)
 async def upload_video(
     file: UploadFile = File(...),
@@ -2851,6 +2857,104 @@ async def export_video(
         raise
     except Exception as e:
         logger.error(f"Error exporting video: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/videos/{video_id}/highlights/export")
+async def export_highlight(
+    video_id: str,
+    request: ExportHighlightRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Export a highlight clip from a video with specified aspect ratio.
+    
+    Args:
+        video_id: UUID of the video
+        request: ExportHighlightRequest with start_time, end_time, and aspect_ratio
+        background_tasks: FastAPI background tasks for cleanup
+        db: Database session
+        
+    Returns:
+        FileResponse with the exported video clip
+    """
+    try:
+        video_uuid = UUID(video_id)
+        
+        # Validate aspect ratio
+        valid_ratios = ["9:16", "1:1", "16:9"]
+        if request.aspect_ratio not in valid_ratios:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid aspect ratio. Supported ratios: {', '.join(valid_ratios)}"
+            )
+        
+        # Validate timestamps
+        if request.end_time <= request.start_time:
+            raise HTTPException(
+                status_code=400,
+                detail="end_time must be greater than start_time"
+            )
+        
+        # Verify video exists
+        video = await crud.get_video_by_id(db, video_uuid)
+        if not video:
+            raise HTTPException(status_code=404, detail="Video not found")
+        
+        # Get video path
+        video_path = await get_video_path(video_uuid, db, download_local=True)
+        if not video_path:
+            raise HTTPException(status_code=404, detail="Video file not found")
+        
+        # Close DB session early - generate_moment_async doesn't need it
+        await db.close()
+        
+        # Generate the moment/clip with aspect ratio
+        relative_path, temp_file_path = await generate_moment_async(
+            video_path,
+            request.start_time,
+            request.end_time,
+            request.aspect_ratio
+        )
+        
+        # Determine the output file path
+        if temp_file_path:
+            # Using S3 - temp file is the output
+            output_path = temp_file_path
+        else:
+            # Local storage - construct full path
+            from utils.storage import UPLOAD_DIR
+            output_path = os.path.join(UPLOAD_DIR, relative_path)
+        
+        # Verify file exists
+        if not os.path.exists(output_path):
+            raise HTTPException(status_code=500, detail="Generated highlight file not found")
+        
+        # Generate filename
+        duration = request.end_time - request.start_time
+        filename = f"highlight_{request.start_time:.1f}s_{request.end_time:.1f}s_{request.aspect_ratio.replace(':', 'x')}.mp4"
+        
+        def cleanup_file():
+            try:
+                if temp_file_path and os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+            except Exception:
+                pass
+        
+        background_tasks.add_task(cleanup_file)
+        
+        return FileResponse(
+            path=output_path,
+            media_type="video/mp4",
+            filename=filename,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error exporting highlight: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
