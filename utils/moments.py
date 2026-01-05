@@ -38,8 +38,8 @@ def get_aspect_ratio_filter(aspect_ratio: str) -> Optional[str]:
     
     if aspect_ratio == "1:1":
         # Square: crop to smaller dimension, center, then scale
-        # Use min() to get smaller dimension, works for both orientations
-        return "crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,scale=1080:1080"
+        # Use conditional expression since min() isn't supported in crop filter
+        return "crop='if(gt(iw,ih),ih,iw)':'if(gt(iw,ih),ih,iw)':(iw-if(gt(iw,ih),ih,iw))/2:(ih-if(gt(iw,ih),ih,iw))/2,scale=1080:1080"
     elif aspect_ratio == "9:16":
         # Vertical: crop width to match 9:16, center horizontally
         return f"crop=ih*{w}/{h}:ih:(iw-ih*{w}/{h})/2:0,scale={target_w}:-2"
@@ -202,11 +202,27 @@ def generate_moment(video_path: str, start: float, end: float, aspect_ratio: Opt
         
     except ffmpeg.Error as e:
         error_message = e.stderr.decode() if e.stderr else str(e)
-        # Extract actual error (skip version info at start)
+        # Extract actual error (skip version/build info, prioritize error lines)
         error_lines = error_message.split('\n')
-        actual_error = '\n'.join([line for line in error_lines if line and not line.startswith('ffmpeg version') and not line.startswith('built with') and not line.startswith('configuration:')])
-        if not actual_error.strip():
-            actual_error = error_message
+        
+        # First, try to find lines with error indicators
+        error_keywords = ['error', 'Error', 'ERROR', 'failed', 'Failed', 'FAILED', 'invalid', 'Invalid']
+        error_lines_found = [line for line in error_lines if any(keyword in line for keyword in error_keywords)]
+        
+        if error_lines_found:
+            # Use lines with error keywords, filtering out build info
+            skip_patterns = ['ffmpeg version', 'built with', 'configuration:', 'libav', '  lib']
+            filtered = [line for line in error_lines_found if not any(line.strip().startswith(p) for p in skip_patterns)]
+            actual_error = '\n'.join(filtered[-5:]).strip() if filtered else '\n'.join(error_lines_found[-5:]).strip()
+        else:
+            # No error keywords found, filter out build info and take last meaningful lines
+            skip_patterns = ['ffmpeg version', 'built with', 'configuration:', 'libav', '  lib']
+            filtered_lines = [line for line in error_lines if line.strip() and not any(line.strip().startswith(p) for p in skip_patterns)]
+            actual_error = '\n'.join(filtered_lines[-10:]).strip() if filtered_lines else error_message[-500:].strip()
+        
+        if not actual_error:
+            actual_error = error_message[-500:] if len(error_message) > 500 else error_message
+        
         error_msg = actual_error[:1000] if len(actual_error) > 1000 else actual_error
         logger.error(f"FFmpeg error generating moment: {error_msg}")
         if os.path.exists(temp_moment_path):
