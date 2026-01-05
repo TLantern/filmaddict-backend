@@ -34,8 +34,23 @@ def get_aspect_ratio_filter(aspect_ratio: str) -> Optional[str]:
         return None
     
     w, h = ratios[aspect_ratio]
-    # Center crop to the target aspect ratio
-    return f"crop=ih*{w}/{h}:ih:(iw-ih*{w}/{h})/2:0,scale=1080:-2" if w < h else f"crop=iw:iw*{h}/{w}:0:(ih-iw*{h}/{w})/2,scale=-2:1080"
+    target_w, target_h = 1080, 1080
+    
+    if aspect_ratio == "1:1":
+        # Square: crop to smaller dimension, center, then scale
+        # Use min() to get smaller dimension, works for both orientations
+        return "crop=min(iw,ih):min(iw,ih):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2,scale=1080:1080"
+    elif aspect_ratio == "9:16":
+        # Vertical: crop width to match 9:16, center horizontally
+        return f"crop=ih*{w}/{h}:ih:(iw-ih*{w}/{h})/2:0,scale={target_w}:-2"
+    elif aspect_ratio == "16:9":
+        # Horizontal: crop height to match 16:9, center vertically
+        return f"crop=iw:iw*{h}/{w}:0:(ih-iw*{h}/{w})/2,scale=-2:{target_h}"
+    elif aspect_ratio == "4:5":
+        # Portrait: crop width to match 4:5, center horizontally
+        return f"crop=ih*{w}/{h}:ih:(iw-ih*{w}/{h})/2:0,scale={target_w}:-2"
+    
+    return None
 
 
 def _run_ffmpeg_with_fallback(video_path: str, temp_moment_path: str, start: float, duration: float, vf_filter: Optional[str] = None) -> None:
@@ -60,9 +75,9 @@ def _run_ffmpeg_with_fallback(video_path: str, temp_moment_path: str, start: flo
             vf=vf_filter,
             vcodec="libx264",
             acodec="aac",
-            preset="fast",
-            crf=23,
-            **{"movflags": "faststart", "max_muxing_queue_size": "1024"},
+            preset="ultrafast",
+            crf=28,
+            **{"movflags": "faststart", "max_muxing_queue_size": "1024", "threads": "0"},
         )
         ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
         return
@@ -105,9 +120,9 @@ def _run_ffmpeg_with_fallback(video_path: str, temp_moment_path: str, start: flo
         temp_moment_path,
         vcodec="libx264",
         acodec="aac",
-        preset="fast",
-        crf=23,
-        **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024"},
+        preset="ultrafast",
+        crf=28,
+        **{"movflags": "faststart", "avoid_negative_ts": "make_zero", "max_muxing_queue_size": "1024", "threads": "0"},
     )
     ffmpeg.run(stream, overwrite_output=True, quiet=True, capture_stderr=True)
 
@@ -187,13 +202,19 @@ def generate_moment(video_path: str, start: float, end: float, aspect_ratio: Opt
         
     except ffmpeg.Error as e:
         error_message = e.stderr.decode() if e.stderr else str(e)
-        logger.error(f"FFmpeg error generating moment: {error_message[:500]}")
+        # Extract actual error (skip version info at start)
+        error_lines = error_message.split('\n')
+        actual_error = '\n'.join([line for line in error_lines if line and not line.startswith('ffmpeg version') and not line.startswith('built with') and not line.startswith('configuration:')])
+        if not actual_error.strip():
+            actual_error = error_message
+        error_msg = actual_error[:1000] if len(actual_error) > 1000 else actual_error
+        logger.error(f"FFmpeg error generating moment: {error_msg}")
         if os.path.exists(temp_moment_path):
             try:
                 os.remove(temp_moment_path)
             except:
                 pass
-        raise Exception(f"Failed to generate moment: {error_message[:500]}")
+        raise Exception(f"Failed to generate moment: {error_msg}")
     except Exception as e:
         logger.error(f"Error generating moment: {str(e)}", exc_info=True)
         if os.path.exists(temp_moment_path):
